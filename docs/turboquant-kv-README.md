@@ -168,8 +168,8 @@ After CUDA kernels land:
 - [x] **Sprint 2** — CPU reference + tests + CI
 - [x] **Sprint 3** — CUDA kernels (Volta/Ampere)
 - [x] **Sprint 4** — Tiered cache data structure (hot fp16 + cold TQ)
-- [x] **Sprint 4b** — `GGML_TYPE_TQ_KV{2,3,4}` registration + CLI parsing ← *you are here*
-- [ ] **Sprint 4c** — Wire `tiered_cache` into `llama_memory_i` (the actual KV storage backend)
+- [x] **Sprint 4b** — `GGML_TYPE_TQ_KV{2,3,4}` registration + CLI parsing
+- [ ] **Sprint 4c** — Wire `tiered_cache` into `llama_kv_cache` ← *you are here* (plan: [`turboquant-kv-sprint4c-plan.md`](turboquant-kv-sprint4c-plan.md))
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split
