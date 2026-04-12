@@ -185,6 +185,8 @@ def run_one(llama_cli: Path,
             stdin=subprocess.DEVNULL, env=env, text=True,
             bufsize=1,
         )
+        assert proc.stdout is not None  # PIPE was requested
+        stdout = proc.stdout
         chunks: list[str] = []
         total = 0
         deadline = time.time() + timeout_s
@@ -194,14 +196,14 @@ def run_one(llama_cli: Path,
         while True:
             if proc.poll() is not None:
                 # Read anything left.
-                remaining = proc.stdout.read()
+                remaining = stdout.read()
                 if remaining:
                     chunks.append(remaining)
                 break
             remain = max(0.0, deadline - time.time())
-            r, _, _ = select.select([proc.stdout], [], [], min(remain, 0.5))
+            r, _, _ = select.select([stdout], [], [], min(remain, 0.5))
             if r:
-                line = proc.stdout.readline()
+                line = stdout.readline()
                 if not line:
                     break
                 chunks.append(line)
