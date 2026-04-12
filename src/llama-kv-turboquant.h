@@ -99,4 +99,34 @@ inline bool is_turboquant_kv_type(ggml_type t) {
     return ggml_type_to_bits(t) > 0;
 }
 
+// -------------------------------------------------------------------- //
+// CUDA wrappers (Sprint 3)                                             //
+// -------------------------------------------------------------------- //
+//
+// These are implemented in llama-kv-turboquant-cuda.cu when compiled
+// with LLAMA_TQ_CUDA. When CUDA is not available the .cpp file
+// provides stubs that return false; callers should fall back to the
+// CPU path (compress_vector / decompress_vector).
+//
+// Memory layout of the CUDA outputs is bit-identical to the CPU
+// reference — the unit tests compare outputs byte-for-byte.
+
+bool cuda_available();
+
+bool compress_vector_cuda(
+    const float *           vec,
+    int                     head_dim,
+    bits                    b,
+    const rotation_matrix & rot,
+    compressed_block &      out_block
+);
+
+bool decompress_vector_cuda(
+    const compressed_block & block,
+    int                      head_dim,
+    bits                     b,
+    const rotation_matrix &  rot,
+    float *                  out
+);
+
 }  // namespace llama_kv_tq

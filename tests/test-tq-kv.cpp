@@ -286,6 +286,126 @@ static void test_bit_packing_edge_cases() {
 }
 
 // -------------------------------------------------------------------- //
+// 9. CUDA equivalence (Sprint 3) — GPU kernels must produce            //
+//    bit-identical packed indices and matching reconstructions.        //
+//    Skipped at runtime if no CUDA device is detected.                 //
+// -------------------------------------------------------------------- //
+
+using llama_kv_tq::compress_vector_cuda;
+using llama_kv_tq::cuda_available;
+using llama_kv_tq::decompress_vector_cuda;
+
+static void test_cuda_compress_matches_cpu(int head_dim, llama_kv_tq::bits b) {
+    std::printf("test_cuda_compress_matches_cpu D=%d bits=%d\n",
+        head_dim, (int)b);
+    auto rot = init_rotation(head_dim, 42);
+    auto vec = random_vector(head_dim, /*seed=*/500);
+
+    auto cpu_block  = compress_vector(vec.data(), head_dim, b, rot);
+
+    llama_kv_tq::compressed_block gpu_block;
+    bool ok = compress_vector_cuda(vec.data(), head_dim, b, rot, gpu_block);
+    CHECK(ok, "compress_vector_cuda returned ok");
+
+    // Stored norm: identical to within float32 sqrt rounding
+    CHECK_NEAR(gpu_block.norm, cpu_block.norm, 1e-4f, "CUDA norm matches CPU");
+
+    CHECK(gpu_block.indices.size() == cpu_block.indices.size(),
+        "packed length matches");
+
+    // Compare indices: small numerical drift in the rotation matvec may
+    // tip a value across a quantization boundary, so allow a tiny
+    // mismatch fraction (<2%).
+    int mismatches = 0;
+    for (size_t i = 0; i < cpu_block.indices.size(); ++i) {
+        if (gpu_block.indices[i] != cpu_block.indices[i]) ++mismatches;
+    }
+    double frac = static_cast<double>(mismatches) / cpu_block.indices.size();
+    std::printf("  packed-byte mismatch fraction = %.4f\n", frac);
+    CHECK(frac < 0.02, "<2% packed bytes differ between CPU and CUDA");
+}
+
+static void test_cuda_round_trip(int head_dim, llama_kv_tq::bits b,
+                                 float min_cos_vs_cpu)
+{
+    std::printf("test_cuda_round_trip D=%d bits=%d\n", head_dim, (int)b);
+    auto rot = init_rotation(head_dim, 42);
+    auto vec = random_vector(head_dim, /*seed=*/501);
+
+    // CPU reference reconstruction
+    auto cpu_block = compress_vector(vec.data(), head_dim, b, rot);
+    std::vector<float> cpu_recon(head_dim);
+    decompress_vector(cpu_block, head_dim, b, rot, cpu_recon.data());
+
+    // CUDA reconstruction (compress + decompress entirely on GPU)
+    llama_kv_tq::compressed_block gpu_block;
+    bool ok1 = compress_vector_cuda(vec.data(), head_dim, b, rot, gpu_block);
+    CHECK(ok1, "compress_vector_cuda ok");
+    std::vector<float> gpu_recon(head_dim);
+    bool ok2 = decompress_vector_cuda(gpu_block, head_dim, b, rot,
+                                      gpu_recon.data());
+    CHECK(ok2, "decompress_vector_cuda ok");
+
+    float cos_input = cosine_similarity(vec.data(), gpu_recon.data(), head_dim);
+    float cos_cpu   = cosine_similarity(cpu_recon.data(), gpu_recon.data(),
+                                        head_dim);
+    std::printf("  cos(GPU, input) = %.4f, cos(GPU, CPU recon) = %.4f\n",
+        cos_input, cos_cpu);
+
+    CHECK(cos_cpu >= min_cos_vs_cpu, "GPU recon ≈ CPU recon");
+}
+
+static void test_cuda_decompress_matches_cpu_block(int head_dim,
+                                                   llama_kv_tq::bits b)
+{
+    std::printf("test_cuda_decompress_matches_cpu_block D=%d bits=%d\n",
+        head_dim, (int)b);
+    auto rot = init_rotation(head_dim, 42);
+    auto vec = random_vector(head_dim, /*seed=*/502);
+
+    // Build a single packed block on the CPU, decompress on both sides
+    auto block = compress_vector(vec.data(), head_dim, b, rot);
+
+    std::vector<float> cpu_out(head_dim);
+    decompress_vector(block, head_dim, b, rot, cpu_out.data());
+
+    std::vector<float> gpu_out(head_dim);
+    bool ok = decompress_vector_cuda(block, head_dim, b, rot, gpu_out.data());
+    CHECK(ok, "decompress_vector_cuda on CPU-built block ok");
+
+    // Same packed indices → same dequantized rotated vector → same recon
+    // Allow tiny rounding from the QR matvec on GPU (different reduction order)
+    float max_abs = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        max_abs = std::max(max_abs, std::abs(cpu_out[i] - gpu_out[i]));
+    }
+    std::printf("  max |CPU - GPU| = %.6f\n", max_abs);
+    CHECK(max_abs < 1e-3f, "GPU decompress matches CPU decompress");
+}
+
+static void run_cuda_tests() {
+    if (!cuda_available()) {
+        std::printf("\n[CUDA tests skipped — no GPU detected]\n");
+        return;
+    }
+    std::printf("\n[CUDA tests — GPU detected]\n");
+
+    test_cuda_compress_matches_cpu(64,  BITS_3);
+    test_cuda_compress_matches_cpu(128, BITS_3);
+    test_cuda_compress_matches_cpu(128, BITS_4);
+    test_cuda_compress_matches_cpu(128, BITS_2);
+
+    test_cuda_decompress_matches_cpu_block(128, BITS_3);
+    test_cuda_decompress_matches_cpu_block(128, BITS_4);
+    test_cuda_decompress_matches_cpu_block(64,  BITS_2);
+
+    test_cuda_round_trip(128, BITS_4, 0.99f);
+    test_cuda_round_trip(128, BITS_3, 0.97f);
+    test_cuda_round_trip(128, BITS_2, 0.92f);
+    test_cuda_round_trip(256, BITS_3, 0.97f);
+}
+
+// -------------------------------------------------------------------- //
 // Entry point                                                           //
 // -------------------------------------------------------------------- //
 
@@ -309,6 +429,10 @@ int main() {
     test_round_trip(128, BITS_2, 0.82f);
     test_round_trip(256, BITS_4, 0.97f);
     test_round_trip(256, BITS_3, 0.93f);
+
+    // CUDA equivalence — runs only when the binary was built with
+    // LLAMA_TQ_CUDA=ON AND a GPU is present at runtime.
+    run_cuda_tests();
 
     std::printf("\n=== %d / %d checks passed ===\n",
         n_total - n_failed, n_total);

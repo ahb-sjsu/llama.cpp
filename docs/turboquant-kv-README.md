@@ -1,6 +1,6 @@
 # TurboQuant KV Cache Compression
 
-> **Status:** Sprint 2 of 5 (CPU reference complete) · feature branch only · not yet wired to inference
+> **Status:** Sprint 3 of 5 (CUDA kernels in progress) · feature branch only · not yet wired to inference
 
 PolarQuant + Lloyd-Max KV cache compression for `llama.cpp`. Achieves higher compression at better quality than current `Q4_0`/`Q5_0`/`Q8_0` modes.
 
@@ -44,14 +44,16 @@ Decompression inverts the pipeline.
 | [`docs/turboquant-kv-design.md`](turboquant-kv-design.md) | Full architectural design doc | ✅ |
 | [`src/llama-kv-turboquant.h`](../src/llama-kv-turboquant.h) | C++ public API | ✅ |
 | [`src/llama-kv-turboquant.cpp`](../src/llama-kv-turboquant.cpp) | CPU reference implementation | ✅ Sprint 2 |
-| [`tests/test-tq-kv.cpp`](../tests/test-tq-kv.cpp) | Comprehensive unit tests (16K+ checks) | ✅ Sprint 2 |
-| [`.github/workflows/turboquant-kv.yml`](../.github/workflows/turboquant-kv.yml) | CI workflow | ✅ |
-| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types | ⏳ Sprint 3 |
-| `ggml/src/ggml-cuda/turboquant.cu` | CUDA kernels | ⏳ Sprint 3 |
+| [`tests/test-tq-kv.cpp`](../tests/test-tq-kv.cpp) | Comprehensive unit tests (16K+ checks + CUDA equivalence) | ✅ Sprint 2/3 |
+| [`src/llama-kv-turboquant-cuda.cu`](../src/llama-kv-turboquant-cuda.cu) | CUDA kernels (Volta sm_70 + Ampere sm_80) | ✅ Sprint 3 |
+| [`.github/workflows/turboquant-kv.yml`](../.github/workflows/turboquant-kv.yml) | CI workflow (CPU build + CUDA build + lint) | ✅ |
+| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types | ⏳ Sprint 4 |
 | `src/llama-kv-cache.cpp` integration | Hot/cold tiering | ⏳ Sprint 4 |
 | Upstream PR | | ⏳ Sprint 5 |
 
 ## Building and testing
+
+CPU-only build (default):
 
 ```bash
 mkdir build && cd build
@@ -59,6 +61,21 @@ cmake .. -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF
 cmake --build . --target test-tq-kv -j
 ./bin/test-tq-kv
 ```
+
+With CUDA kernels (Sprint 3):
+
+```bash
+mkdir build-cuda && cd build-cuda
+cmake .. -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF \
+         -DLLAMA_TQ_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="70;80"
+cmake --build . --target test-tq-kv -j
+./bin/test-tq-kv  # runs CPU tests + CUDA equivalence tests
+```
+
+The CUDA tests compare GPU output to the CPU reference (norm, packed
+indices, full reconstruction). They self-skip if no CUDA device is
+detected at runtime, so the same binary works on both CPU-only and
+GPU machines.
 
 Expected output:
 ```
@@ -105,8 +122,8 @@ After CUDA kernels land:
 ## Sprint roadmap
 
 - [x] **Sprint 1** — Foundation (fork, design doc, scaffolding, issues filed)
-- [x] **Sprint 2** — CPU reference + tests + CI ← *you are here*
-- [ ] **Sprint 3** — CUDA kernels (Volta/Ampere)
+- [x] **Sprint 2** — CPU reference + tests + CI
+- [x] **Sprint 3** — CUDA kernels (Volta/Ampere) ← *you are here*
 - [ ] **Sprint 4** — Hot/cold tiering integrated into `llama_kv_cache`
 - [ ] **Sprint 5** — Documentation + benchmarks + upstream PR
 

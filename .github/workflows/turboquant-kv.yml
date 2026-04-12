@@ -8,14 +8,15 @@ on:
   push:
     branches: [feature/turboquant-kv-cache]
     paths:
-      - 'src/llama-kv-turboquant.*'
+      - 'src/llama-kv-turboquant*'
       - 'tests/test-tq-kv.cpp'
       - 'tests/CMakeLists.txt'
       - 'docs/turboquant-kv-design.md'
+      - 'docs/turboquant-kv-README.md'
       - '.github/workflows/turboquant-kv.yml'
   pull_request:
     paths:
-      - 'src/llama-kv-turboquant.*'
+      - 'src/llama-kv-turboquant*'
       - 'tests/test-tq-kv.cpp'
 
 jobs:
@@ -51,6 +52,41 @@ jobs:
           cd build
           ./bin/test-tq-kv
 
+  cuda-build:
+    name: CUDA build (Sprint 3, build-only — no GPU runner)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.0-devel-ubuntu22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          apt-get update
+          apt-get install -y cmake build-essential git
+
+      - name: Configure CMake (CUDA enabled)
+        run: |
+          mkdir -p build-cuda
+          cd build-cuda
+          cmake .. \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_TQ_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="70;80"
+
+      - name: Build test-tq-kv with CUDA kernels
+        run: |
+          cd build-cuda
+          cmake --build . --target test-tq-kv -j 2
+
+      # Cannot run the binary (no GPU on free runners), but the
+      # build verifies the .cu file compiles for sm_70 and sm_80
+      # and that the host wrappers link against cudart correctly.
+
   lint:
     name: Lint (clang-format check)
     runs-on: ubuntu-latest
@@ -66,7 +102,10 @@ jobs:
           # llama.cpp doesn't enforce a global style — we just check
           # that the TQ KV files don't have trailing whitespace or
           # tabs (project conventions).
-          for f in src/llama-kv-turboquant.h src/llama-kv-turboquant.cpp tests/test-tq-kv.cpp; do
+          for f in src/llama-kv-turboquant.h \
+                   src/llama-kv-turboquant.cpp \
+                   src/llama-kv-turboquant-cuda.cu \
+                   tests/test-tq-kv.cpp; do
             if grep -P '\t' "$f"; then
               echo "Tabs found in $f — use spaces"
               exit 1

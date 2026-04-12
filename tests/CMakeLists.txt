@@ -165,17 +165,38 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         llama_build(test-quantize-stats.cpp)
     endif()
 
-    # TurboQuant KV cache compression tests (Sprint 2)
-    # Standalone — only needs llama-kv-turboquant.cpp + STL.
-    add_executable(test-tq-kv
+    # TurboQuant KV cache compression tests (Sprint 2 + Sprint 3)
+    # Standalone — only needs llama-kv-turboquant.cpp + STL by default.
+    # When LLAMA_TQ_CUDA=ON, also compiles the CUDA kernels and runs
+    # the GPU-vs-CPU equivalence checks.
+    set(TQ_KV_SOURCES
         test-tq-kv.cpp
         ${PROJECT_SOURCE_DIR}/src/llama-kv-turboquant.cpp
     )
+
+    option(LLAMA_TQ_CUDA "Build TurboQuant KV CUDA kernels" OFF)
+    if (LLAMA_TQ_CUDA)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        list(APPEND TQ_KV_SOURCES
+            ${PROJECT_SOURCE_DIR}/src/llama-kv-turboquant-cuda.cu)
+    endif()
+
+    add_executable(test-tq-kv ${TQ_KV_SOURCES})
     target_include_directories(test-tq-kv PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/ggml/include
     )
     target_link_libraries(test-tq-kv PRIVATE ggml)
+
+    if (LLAMA_TQ_CUDA)
+        target_compile_definitions(test-tq-kv PRIVATE LLAMA_TQ_CUDA)
+        target_link_libraries(test-tq-kv PRIVATE CUDA::cudart)
+        # Volta (GV100) and Ampere/Hopper
+        set_target_properties(test-tq-kv PROPERTIES
+            CUDA_ARCHITECTURES "70;80")
+    endif()
+
     add_test(NAME test-tq-kv COMMAND test-tq-kv)
     set_tests_properties(test-tq-kv PROPERTIES LABELS "main")
 

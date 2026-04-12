@@ -426,4 +426,38 @@ void decompress_vector(
     }
 }
 
+// -------------------------------------------------------------------- //
+// CUDA wrapper stubs                                                    //
+//                                                                       //
+// When LLAMA_TQ_CUDA is defined the real implementations live in        //
+// llama-kv-turboquant-cuda.cu. Otherwise these stubs report no GPU      //
+// available so callers fall back to the CPU path above.                 //
+// -------------------------------------------------------------------- //
+
+#ifndef LLAMA_TQ_CUDA
+bool cuda_available() {
+    return false;
+}
+
+bool compress_vector_cuda(
+    const float *           /*vec*/,
+    int                     /*head_dim*/,
+    bits                    /*b*/,
+    const rotation_matrix & /*rot*/,
+    compressed_block &      /*out_block*/
+) {
+    return false;
+}
+
+bool decompress_vector_cuda(
+    const compressed_block & /*block*/,
+    int                      /*head_dim*/,
+    bits                     /*b*/,
+    const rotation_matrix &  /*rot*/,
+    float *                  /*out*/
+) {
+    return false;
+}
+#endif  // LLAMA_TQ_CUDA
+
 }  // namespace llama_kv_tq
