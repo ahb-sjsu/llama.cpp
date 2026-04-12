@@ -1664,6 +1664,28 @@ void llama_kv_cache::tq_flush_pending_() {
     std::vector<std::vector<cold_check_t>> cold_check_k(layers.size());
     std::vector<std::vector<cold_check_t>> cold_check_v(layers.size());
 
+    // Phase 1C: prefetch each layer's V tensor once per flush when the
+    // cache is v_trans. The per-element strided read inside observe_one
+    // would otherwise cost n_embd_v_gqa * pending_tokens backend-get
+    // calls per layer; this collapses the backend traffic to a single
+    // full-tensor read per layer, with the strided extraction moving to
+    // a memcpy-speed host-memory scan.
+    std::vector<std::vector<uint16_t>> v_slabs(layers.size());
+    if (v_trans && !tq_pending_.empty()) {
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            ggml_tensor * v_src = layers[ikv].v;
+            if (tq_view_bind_ && ikv < tq_view_v_.size() && tq_view_v_[ikv]) {
+                v_src = tq_view_v_[ikv];
+            }
+            if (!v_src || ikv >= tq_v_caches.size() || !tq_v_caches[ikv]) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(v_src);
+            v_slabs[ikv].resize(nbytes / sizeof(uint16_t));
+            ggml_backend_tensor_get(v_src, v_slabs[ikv].data(), 0, nbytes);
+        }
+    }
+
     for (const auto & pend : tq_pending_) {
         const size_t n = pend.idxs.size();
         for (size_t t = 0; t < n; ++t) {
@@ -1694,13 +1716,27 @@ void llama_kv_cache::tq_flush_pending_() {
                         // (one element per row, all kv positions across
                         // a row). Token `idx`'s V values are scattered
                         // at strided offsets [(e * kv_size + idx) * 2]
-                        // for e in [0, n_embd_v_gqa). Read per-element.
-                        const size_t base = (size_t) strm * strm_bytes
-                                          + (size_t) read_idx * fp16_sz;
-                        for (size_t e = 0; e < n_elem; ++e) {
-                            const size_t off = base + e * kv_size_ * fp16_sz;
-                            ggml_backend_tensor_get(
-                                cache, &fp16_buf[e], off, fp16_sz);
+                        // for e in [0, n_embd_v_gqa). Phase 1C: the slab
+                        // was prefetched once per flush; read the
+                        // strided columns from host memory instead of
+                        // issuing n_embd_v_gqa backend-get calls per
+                        // token.
+                        if (ikv < v_slabs.size() && !v_slabs[ikv].empty()) {
+                            const uint16_t * slab = v_slabs[ikv].data();
+                            const size_t strm_stride = strm_bytes / fp16_sz;
+                            const size_t base = (size_t) strm * strm_stride
+                                              + (size_t) read_idx;
+                            for (size_t e = 0; e < n_elem; ++e) {
+                                fp16_buf[e] = slab[base + e * kv_size_];
+                            }
+                        } else {
+                            const size_t base = (size_t) strm * strm_bytes
+                                              + (size_t) read_idx * fp16_sz;
+                            for (size_t e = 0; e < n_elem; ++e) {
+                                const size_t off = base + e * kv_size_ * fp16_sz;
+                                ggml_backend_tensor_get(
+                                    cache, &fp16_buf[e], off, fp16_sz);
+                            }
                         }
                     } else {
                         // Contiguous row read (K always; V when
@@ -1942,13 +1978,22 @@ void llama_kv_cache::tq_flush_pending_() {
         };
 
         for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
-            cold_check_one(layers[ikv].k,
+            // Phase 1B: when view-bind is on, the view is the actual
+            // source of truth. cold_check must read from it, not the
+            // ring-modulo-addressed (possibly shrunk) backbone.
+            ggml_tensor * k_src = layers[ikv].k;
+            ggml_tensor * v_src = layers[ikv].v;
+            if (tq_view_bind_) {
+                if (ikv < tq_view_k_.size() && tq_view_k_[ikv]) k_src = tq_view_k_[ikv];
+                if (ikv < tq_view_v_.size() && tq_view_v_[ikv]) v_src = tq_view_v_[ikv];
+            }
+            cold_check_one(k_src,
                 ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                 cold_check_k[ikv], /*is_v_side=*/false);
             // Sprint 4c step 3c-4: cold_check_one is now transpose-aware
             // (per-element reads when is_v_side && v_trans), so V can be
             // validated regardless of v_trans.
-            cold_check_one(layers[ikv].v,
+            cold_check_one(v_src,
                 ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
                 cold_check_v[ikv], /*is_v_side=*/true);
         }
@@ -2174,10 +2219,19 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
+    // Phase 1B: view is the hot-path tensor under view-bind. Type must
+    // match what cpy_k/get_k actually touch so upstream code that keys
+    // on cache-type (e.g. flash-attn capability checks) stays honest.
+    if (tq_view_bind_ && !tq_view_k_.empty() && tq_view_k_[0]) {
+        return tq_view_k_[0]->type;
+    }
     return layers[0].k->type;
 }
 
 ggml_type llama_kv_cache::type_v() const {
+    if (tq_view_bind_ && !tq_view_v_.empty() && tq_view_v_[0]) {
+        return tq_view_v_[0]->type;
+    }
     return layers[0].v->type;
 }
 
@@ -2832,8 +2886,15 @@ size_t llama_kv_cache::total_size() const {
 size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
-    for (const auto & layer : layers) {
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
         size_k_bytes += ggml_nbytes(layer.k);
+        // Phase 1B: under view-bind the parallel view tensor is part of
+        // the resident K footprint. Include it so reported MiB matches
+        // what the allocator actually holds.
+        if (tq_view_bind_ && ikv < tq_view_k_.size() && tq_view_k_[ikv]) {
+            size_k_bytes += ggml_nbytes(tq_view_k_[ikv]);
+        }
     }
 
     return size_k_bytes;
@@ -2842,8 +2903,12 @@ size_t llama_kv_cache::size_k_bytes() const {
 size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
-    for (const auto & layer : layers) {
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const auto & layer = layers[ikv];
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        if (tq_view_bind_ && ikv < tq_view_v_.size() && tq_view_v_[ikv]) {
+            size_v_bytes += ggml_nbytes(tq_view_v_[ikv]);
+        }
     }
 
     return size_v_bytes;

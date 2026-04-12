@@ -51,6 +51,16 @@ remove it or leave as ignored with a warn-once.
 
 Verify: same benchmark, same disagreement %, KV MiB shrinks further.
 
+**Scoping decision (actual):** `SHRINK_BACKBONE=1` already shrinks the
+backbone to a single slot ring buffer — the remaining per-layer
+footprint is negligible, and full allocation elimination requires
+refactoring `k_stream`/`v_stream` views plus `state_write`/`state_read`
+serialization (risky for marginal memory win). Landed the
+*correctness-redirect* subset only: `cold_check_one`, `type_k`/`type_v`,
+and `size_k_bytes`/`size_v_bytes` all consult the view tensor when
+view-bind is active. Backbone allocation-elimination is deferred until
+a separate sprint that also reworks serialization.
+
 #### Step C: batch-read transposed V observation (item 3)
 
 Current v_trans observe does `n_embd_v_gqa` individual
