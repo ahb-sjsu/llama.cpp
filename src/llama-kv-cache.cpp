@@ -789,6 +789,24 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     // read uninitialized fp16 cache rows. The flush now runs from
     // llama_context via post_compute() after process_ubatch returns.
 
+    // Sprint 4c step 3c-2b root cause: prepare() calls apply_ubatch()
+    // *tentatively* below (line "now emplace the ubatch") to test if
+    // the slot fits, then unconditionally rolls back the cells state
+    // at the end of this function. Our apply_ubatch override pushes
+    // to tq_pending_ — but that push doesn't get rolled back, so we
+    // accumulate phantom queue entries. The REAL apply fires later
+    // via llama_kv_cache_context::apply(), at which point we'd queue
+    // the same slot indices a second time. Flush then reads each
+    // slot twice (or more), inflating tiered_cache positions and
+    // making materialize-vs-cache comparisons appear corrupted even
+    // though both halves are individually correct.
+    //
+    // Fix: snapshot tq_pending_'s size on entry; truncate back to that
+    // size at the end (after the cells rollback). This drops the
+    // tentative queueing exactly when prepare() drops the tentative
+    // cells modifications.
+    const size_t tq_pending_save = tq_pending_.size();
+
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -845,6 +863,14 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             cells.set(sinfo.idxs[s], it->v_cells[s]);
             head = it->v_heads_old[s];
         }
+    }
+
+    // Sprint 4c step 3c-2b root cause fix (continued): drop any
+    // tq_pending_ entries the tentative apply_ubatch calls above
+    // pushed. The cells rollback already undid the bookkeeping;
+    // this matches it for our queue.
+    if (tq_pending_.size() > tq_pending_save) {
+        tq_pending_.resize(tq_pending_save);
     }
 
     if (!success) {
@@ -1436,7 +1462,41 @@ void llama_kv_cache::tq_flush_pending_() {
                     // unused half is benign but wasted compute, which
                     // step 3c-2 addresses along with the read wire-up).
                     const int tq_pos_pushed = tq->n_tokens();   // 0-indexed pos this push will land at
+
+                    // Diagnostic 7: log first 4 fp16 values for layer 0 K
+                    // at observe time. Compare with diag-6 materialize.
+                    if (!is_v_side && ikv == 0) {
+                        if (const char * e = std::getenv("LLAMA_TQ_DIAG_WB")) {
+                            if (std::atoi(e) == 7) {
+                                LLAMA_LOG_WARN(
+                                    "%s: DIAG 7 OBSERVE L0 K idx=%u strm=%u pos=%d "
+                                    "fp16[0..3]=%04x %04x %04x %04x\n",
+                                    __func__, idx, strm, tq_pos_pushed,
+                                    fp16_buf[0], fp16_buf[1], fp16_buf[2], fp16_buf[3]);
+                            }
+                        }
+                    }
+
                     tq->add_token(buf.data(), buf.data());
+
+                    // Diagnostic 7 part 2: read it back from TC and log.
+                    if (!is_v_side && ikv == 0) {
+                        if (const char * e = std::getenv("LLAMA_TQ_DIAG_WB")) {
+                            if (std::atoi(e) == 7) {
+                                std::vector<float> rb;
+                                tq->read_token_k(tq_pos_pushed, rb);
+                                // Convert first 4 to fp16 for comparison.
+                                uint16_t fp16_rb[4];
+                                ggml_fp32_to_fp16_row(
+                                    rb.data(), (ggml_fp16_t *) fp16_rb, 4);
+                                LLAMA_LOG_WARN(
+                                    "%s: DIAG 7 READBACK L0 K pos=%d "
+                                    "fp16[0..3]=%04x %04x %04x %04x\n",
+                                    __func__, tq_pos_pushed,
+                                    fp16_rb[0], fp16_rb[1], fp16_rb[2], fp16_rb[3]);
+                            }
+                        }
+                    }
 
                     // Sprint 4c step 3c-2b precursor: record for cold check.
                     if (tq_cold_validate_) {
