@@ -87,12 +87,13 @@ inline double compression_ratio(int head_dim, bits b) {
 
 // Map a TurboQuant ggml_type to its bit width.
 // Returns -1 if not a TurboQuant type.
-//
-// TODO(sprint-2): wire up after adding GGML_TYPE_TQ_KV{2,3,4} to
-// ggml/include/ggml.h and registering them in ggml_type_traits.
-inline int ggml_type_to_bits(ggml_type /*t*/) {
-    // Will return 2/3/4 for GGML_TYPE_TQ_KV{2,3,4}, -1 otherwise.
-    return -1;
+inline int ggml_type_to_bits(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_TQ_KV2: return 2;
+        case GGML_TYPE_TQ_KV3: return 3;
+        case GGML_TYPE_TQ_KV4: return 4;
+        default:               return -1;
+    }
 }
 
 inline bool is_turboquant_kv_type(ggml_type t) {

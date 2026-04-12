@@ -912,6 +912,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // TurboQuant KV-cache type tags (Sprint 4b).
+    // blck_size=0 / type_size=0 because head_dim is a runtime parameter
+    // and these types do not have a static packed layout that ggml ops
+    // can read — they identify a KV-cache storage backend, not a tensor
+    // element type. The KV-cache layer (Sprint 4c) materializes
+    // fp16/fp32 views before any ggml op sees the data.
+    [GGML_TYPE_TQ_KV2] = {
+        .type_name                = "tq_kv2",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TQ_KV3] = {
+        .type_name                = "tq_kv3",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_TQ_KV4] = {
+        .type_name                = "tq_kv4",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

@@ -406,10 +406,52 @@ static void run_cuda_tests() {
 }
 
 // -------------------------------------------------------------------- //
+// 10. ggml type registration (Sprint 4b)                               //
+// -------------------------------------------------------------------- //
+
+static void test_ggml_type_registration() {
+    std::printf("test_ggml_type_registration\n");
+
+    // Names round-trip through ggml_type_name.
+    CHECK(std::string(ggml_type_name(GGML_TYPE_TQ_KV2)) == "tq_kv2",
+        "tq_kv2 type name");
+    CHECK(std::string(ggml_type_name(GGML_TYPE_TQ_KV3)) == "tq_kv3",
+        "tq_kv3 type name");
+    CHECK(std::string(ggml_type_name(GGML_TYPE_TQ_KV4)) == "tq_kv4",
+        "tq_kv4 type name");
+
+    // ggml_type_to_bits decodes correctly.
+    CHECK(llama_kv_tq::ggml_type_to_bits(GGML_TYPE_TQ_KV2) == 2, "TQ_KV2 → 2 bits");
+    CHECK(llama_kv_tq::ggml_type_to_bits(GGML_TYPE_TQ_KV3) == 3, "TQ_KV3 → 3 bits");
+    CHECK(llama_kv_tq::ggml_type_to_bits(GGML_TYPE_TQ_KV4) == 4, "TQ_KV4 → 4 bits");
+    CHECK(llama_kv_tq::ggml_type_to_bits(GGML_TYPE_F16)    == -1, "F16 not TQ");
+    CHECK(llama_kv_tq::ggml_type_to_bits(GGML_TYPE_Q4_0)   == -1, "Q4_0 not TQ");
+
+    // is_turboquant_kv_type predicate.
+    CHECK( llama_kv_tq::is_turboquant_kv_type(GGML_TYPE_TQ_KV3), "tq_kv3 → true");
+    CHECK(!llama_kv_tq::is_turboquant_kv_type(GGML_TYPE_F16),    "f16 → false");
+    CHECK(!llama_kv_tq::is_turboquant_kv_type(GGML_TYPE_Q8_0),   "q8_0 → false");
+
+    // Type traits report blck_size=0 / type_size=0 — these are TAGS,
+    // not packed tensor types. Any code path that tries to compute a
+    // row size for a TQ KV type will fail loudly via the existing
+    // assertions and the friendly message in llama_init_from_model.
+    CHECK(ggml_blck_size(GGML_TYPE_TQ_KV3) == 0, "TQ_KV3 blck_size = 0");
+    CHECK(ggml_type_size(GGML_TYPE_TQ_KV3) == 0, "TQ_KV3 type_size = 0");
+
+    // is_quantized = true so existing code that gates on quantized KV
+    // (e.g. flash-attn checks) recognises them as compressed.
+    CHECK(ggml_is_quantized(GGML_TYPE_TQ_KV2), "TQ_KV2 is quantized");
+    CHECK(ggml_is_quantized(GGML_TYPE_TQ_KV3), "TQ_KV3 is quantized");
+    CHECK(ggml_is_quantized(GGML_TYPE_TQ_KV4), "TQ_KV4 is quantized");
+}
+
+// -------------------------------------------------------------------- //
 // Entry point                                                           //
 // -------------------------------------------------------------------- //
 
 int main() {
+    test_ggml_type_registration();
     test_block_size_and_ratio();
     test_rotation_orthogonality();
     test_structured_rotation();

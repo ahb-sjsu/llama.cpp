@@ -2941,6 +2941,26 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // TurboQuant KV-cache types are tags only at this point — the
+    // storage backend that knows how to allocate, write, and read
+    // them lands in Sprint 4c. Fail clearly here instead of crashing
+    // deep in ggml when blck_size=0.
+    auto is_tq_kv = [](enum ggml_type t) {
+        return t == GGML_TYPE_TQ_KV2 ||
+               t == GGML_TYPE_TQ_KV3 ||
+               t == GGML_TYPE_TQ_KV4;
+    };
+    if (is_tq_kv(params.type_k) || is_tq_kv(params.type_v)) {
+        LLAMA_LOG_ERROR(
+            "%s: cache-type %s/%s is registered but the TurboQuant KV "
+            "storage backend is not yet wired in (Sprint 4c). "
+            "See docs/turboquant-kv-README.md.\n",
+            __func__,
+            ggml_type_name(params.type_k),
+            ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;

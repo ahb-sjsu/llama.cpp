@@ -10,6 +10,10 @@ on:
     paths:
       - 'src/llama-kv-turboquant*'
       - 'src/llama-kv-tiered*'
+      - 'src/llama-context.cpp'
+      - 'common/arg.cpp'
+      - 'ggml/include/ggml.h'
+      - 'ggml/src/ggml.c'
       - 'tests/test-tq-kv.cpp'
       - 'tests/test-tq-tiered.cpp'
       - 'tests/CMakeLists.txt'
@@ -20,6 +24,10 @@ on:
     paths:
       - 'src/llama-kv-turboquant*'
       - 'src/llama-kv-tiered*'
+      - 'src/llama-context.cpp'
+      - 'common/arg.cpp'
+      - 'ggml/include/ggml.h'
+      - 'ggml/src/ggml.c'
       - 'tests/test-tq-kv.cpp'
       - 'tests/test-tq-tiered.cpp'
 

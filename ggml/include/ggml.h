@@ -429,7 +429,18 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        // TurboQuant KV-cache compression (PolarQuant + Lloyd-Max).
+        // These types are TAGS only — they identify a KV-cache storage
+        // backend, NOT a packed tensor layout that ggml ops can read,
+        // because the packing depends on head_dim (a runtime parameter)
+        // not a compile-time block size. type_traits entries report
+        // blck_size=0 / type_size=0 so any accidental use as a
+        // tensor type fails loudly via the existing assertions.
+        // See docs/turboquant-kv-design.md.
+        GGML_TYPE_TQ_KV2  = 42,
+        GGML_TYPE_TQ_KV3  = 43,
+        GGML_TYPE_TQ_KV4  = 44,
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision

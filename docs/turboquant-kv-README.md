@@ -1,6 +1,6 @@
 # TurboQuant KV Cache Compression
 
-> **Status:** Sprint 4 of 5 (tiered cache data structure complete) · feature branch only · not yet wired to inference
+> **Status:** Sprint 4b of 5 (ggml type tags + CLI parsing) · feature branch only · KV storage backend lands in 4c
 
 PolarQuant + Lloyd-Max KV cache compression for `llama.cpp`. Achieves higher compression at better quality than current `Q4_0`/`Q5_0`/`Q8_0` modes.
 
@@ -49,8 +49,10 @@ Decompression inverts the pipeline.
 | [`src/llama-kv-tiered.{h,cpp}`](../src/llama-kv-tiered.h) | Tiered cache data structure (hot fp16 + cold TQ) | ✅ Sprint 4 |
 | [`tests/test-tq-tiered.cpp`](../tests/test-tq-tiered.cpp) | Tiered cache tests (hot/cold/eviction/stats) | ✅ Sprint 4 |
 | [`.github/workflows/turboquant-kv.yml`](../.github/workflows/turboquant-kv.yml) | CI workflow (CPU build + CUDA build + lint) | ✅ |
-| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types | ⏳ Sprint 4b |
-| `src/llama-kv-cache.cpp` adapter | Wire tiered_cache into llama_memory_i | ⏳ Sprint 4b |
+| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types (tags only) | ✅ Sprint 4b |
+| `common/arg.cpp` `--cache-type-k tq_kv3` | CLI parser accepts the new types | ✅ Sprint 4b |
+| `src/llama-context.cpp` | Friendly error until backend lands | ✅ Sprint 4b |
+| `src/llama-kv-cache.cpp` adapter | Wire tiered_cache into llama_memory_i | ⏳ Sprint 4c |
 | Upstream PR | | ⏳ Sprint 5 |
 
 ## Building and testing
@@ -165,19 +167,42 @@ After CUDA kernels land:
 - [x] **Sprint 1** — Foundation (fork, design doc, scaffolding, issues filed)
 - [x] **Sprint 2** — CPU reference + tests + CI
 - [x] **Sprint 3** — CUDA kernels (Volta/Ampere)
-- [x] **Sprint 4** — Tiered cache data structure (hot fp16 + cold TQ) ← *you are here*
-- [ ] **Sprint 4b** — Wire `tiered_cache` into `llama_memory_i` + add `GGML_TYPE_TQ_KV*`
-- [ ] **Sprint 5** — Documentation + benchmarks + upstream PR
+- [x] **Sprint 4** — Tiered cache data structure (hot fp16 + cold TQ)
+- [x] **Sprint 4b** — `GGML_TYPE_TQ_KV{2,3,4}` registration + CLI parsing ← *you are here*
+- [ ] **Sprint 4c** — Wire `tiered_cache` into `llama_memory_i` (the actual KV storage backend)
+- [ ] **Sprint 5** — Benchmarks + upstream PR
 
-### Sprint 4 → 4b scope split
+### Sprint 4 / 4b / 4c scope split
 
-The original plan bundled tiering and the ggml type registration into one
-sprint. In practice these are independent risks: the tiering algorithm
-needs correctness/perf evidence in isolation, while the ggml-side wiring
-(new types, dequantize tables, cuda dispatch, kv-cache adapter,
-prefill/generation graph routing) touches dozens of files across the
-codebase and is best done as its own focused sprint with its own review.
-Sprint 4 ships the proven data structure; Sprint 4b adopts it.
+The original plan bundled tiering, ggml type registration, and the
+KV-cache adapter into one sprint. In practice these are three independent
+risks:
+
+- **Sprint 4** proved the tiering data structure works in isolation.
+- **Sprint 4b** (this) registers the type tags and wires the CLI surface,
+  with a clear failure path until the backend lands. *No inference path
+  changes.*
+- **Sprint 4c** does the real work: a `llama_memory_i` implementation
+  that holds a `tiered_cache` outside ggml's tensor system and
+  materializes fp16 views before each attention step. This is a real
+  refactor of `llama_kv_cache.cpp` and the prefill/generation graphs.
+
+### Why are these "tag" types and not full ggml types?
+
+ggml types assume a compile-time fixed `blck_size` (e.g. `QK_K = 256`
+elements per packed block). TurboQuant compresses one *head_dim*-sized
+vector at a time, where `head_dim` is a runtime model parameter
+(64, 128, 192, 256...). The packed layout depends on `head_dim`, so it
+doesn't fit ggml's "K elements → N bytes" model.
+
+The fix is architectural: TQ-compressed K/V is stored *outside* ggml's
+tensor system (in our `tiered_cache` byte buffers), and the KV-cache
+layer materializes a temporary fp16 ggml tensor for each attention
+step. So `GGML_TYPE_TQ_KV*` are *storage backend tags* — they tell the
+KV-cache layer "use the TurboQuant backend", not "this tensor's elements
+are packed this way". Their `blck_size` and `type_size` are 0 to make
+this contract explicit; any code path that tries to treat them as a
+packed tensor type will fail loudly.
 
 Tracking issue: [ahb-sjsu/turboquant-pro#27](https://github.com/ahb-sjsu/turboquant-pro/issues/27)
 

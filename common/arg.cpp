@@ -390,6 +390,12 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    // TurboQuant KV-cache (Sprint 4b: tags only — backend wired in 4c).
+    // Selecting one of these will fail at context creation with a clear
+    // message until the storage backend lands.
+    GGML_TYPE_TQ_KV2,
+    GGML_TYPE_TQ_KV3,
+    GGML_TYPE_TQ_KV4,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
