@@ -82,6 +82,9 @@ public:
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // Sprint 4c step 3c-1: delegate post-compute to the iswa pair.
+    void post_compute() override { if (mem_attn) mem_attn->post_compute(); }
+
 private:
     const llama_hparams & hparams;
 

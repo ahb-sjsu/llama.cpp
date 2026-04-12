@@ -82,6 +82,10 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // Sprint 4c step 3c-1: delegate post-compute to the attention KV cache.
+    // The recurrent state has no TQ backend, so no hook is needed there.
+    void post_compute() override { if (mem_attn) mem_attn->post_compute(); }
+
 private:
     const llama_hparams & hparams;
 

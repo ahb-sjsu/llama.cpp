@@ -117,6 +117,16 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Sprint 4c step 3c-1: optional post-compute hook.
+    //
+    // Called by llama_context::decode() right after each successful
+    // process_ubatch() returns — i.e. once the backend has executed the
+    // graph that populated the cache tensors for that ubatch. Default
+    // implementation is no-op; llama_kv_cache overrides it to flush the
+    // TurboQuant observation queue so the fp16 values it reads back are
+    // actually post-compute and not racing with scheduler async work.
+    virtual void post_compute() {}
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

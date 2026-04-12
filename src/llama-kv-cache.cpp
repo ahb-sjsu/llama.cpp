@@ -358,14 +358,20 @@ llama_kv_cache::llama_kv_cache(
             if (p) { ++n_tq_k; hot_window = p->config().hot_window; }
         }
         for (const auto & p : tq_v_caches) if (p) ++n_tq_v;
+
+        // Sprint 4c step 3c-1: opt-in runtime validation.
+        if (const char * e = std::getenv("LLAMA_TQ_VALIDATE")) {
+            tq_validate_ = (std::atoi(e) != 0);
+        }
+
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
-            "%d K layers, %d V layers, hot_window=%d "
-            "(override with env LLAMA_TQ_HOT_WINDOW)\n",
+            "%d K layers, %d V layers, hot_window=%d, validate=%d "
+            "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE)\n",
             __func__,
             ggml_type_name(requested_type_k_),
             ggml_type_name(requested_type_v_),
-            n_tq_k, n_tq_v, hot_window);
+            n_tq_k, n_tq_v, hot_window, (int) tq_validate_);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -761,12 +767,10 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
-    // Sprint 4c step 2b: flush any TQ observations left over from a
-    // previous decode() call. Between decodes there is no active graph
-    // compute, so the cache tensor is in a stable state.
-    if (is_tq()) {
-        tq_flush_pending_();
-    }
+    // Sprint 4c step 3c-1: the flush previously lived here. It was
+    // pre-compute, so it raced with the graph scheduler and could
+    // read uninitialized fp16 cache rows. The flush now runs from
+    // llama_context via post_compute() after process_ubatch returns.
 
     llama_kv_cache::slot_info_vec_t res;
 
@@ -1108,6 +1112,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::post_compute() {
+    // Sprint 4c step 3c-1: the only post-compute work we have today is
+    // draining the TQ observation queue. Non-TQ caches skip this.
+    if (is_tq()) {
+        tq_flush_pending_();
+    }
+}
+
 void llama_kv_cache::tq_materialize_fp16_k(int32_t il,
                                            int start_pos,
                                            int n_positions,
@@ -1161,7 +1173,8 @@ void llama_kv_cache::tq_flush_pending_() {
 
                 auto observe_one = [&](ggml_tensor * cache,
                                        llama_kv_tq::tiered_cache * tq,
-                                       std::vector<float> & buf) {
+                                       std::vector<float> & buf,
+                                       bool is_v_side) {
                     if (!cache || !tq) return;
                     const size_t n_elem    = cache->ne[0];
                     const size_t row_bytes = cache->nb[1];
@@ -1178,18 +1191,45 @@ void llama_kv_cache::tq_flush_pending_() {
                         buf.data(), n_elem);
                     // tiered_cache takes K and V as separate pointers;
                     // at this step we pass the same buffer for both
-                    // (V is handled by its own call below so this is
-                    // benign — the second arg is unused for this cache's
-                    // purpose since we only care about the K or V side).
+                    // (the other side is handled by its own call — the
+                    // unused half is benign but wasted compute, which
+                    // step 3c-2 addresses along with the read wire-up).
                     tq->add_token(buf.data(), buf.data());
+
+                    // Sprint 4c step 3c-1: post-push round-trip check.
+                    if (tq_validate_) {
+                        const int last_pos = tq->n_tokens() - 1;
+                        std::vector<float> rb;
+                        if (is_v_side) tq->read_token_v(last_pos, rb);
+                        else           tq->read_token_k(last_pos, rb);
+
+                        double dot = 0, na = 0, nb = 0;
+                        for (size_t i = 0; i < n_elem; ++i) {
+                            dot += (double) buf[i] * rb[i];
+                            na  += (double) buf[i] * buf[i];
+                            nb  += (double) rb[i]  * rb[i];
+                        }
+                        const double denom = std::sqrt(na) * std::sqrt(nb);
+                        const float cos = denom > 1e-12
+                            ? (float) (dot / denom) : 0.0f;
+                        if (is_v_side) {
+                            tq_validate_sum_cos_v_ += cos;
+                            tq_validate_count_v_++;
+                            if (cos < tq_validate_min_cos_v_) tq_validate_min_cos_v_ = cos;
+                        } else {
+                            tq_validate_sum_cos_k_ += cos;
+                            tq_validate_count_k_++;
+                            if (cos < tq_validate_min_cos_k_) tq_validate_min_cos_k_ = cos;
+                        }
+                    }
                 };
 
                 observe_one(L.k,
                             ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
-                            k_buf);
+                            k_buf, /*is_v_side=*/false);
                 observe_one(L.v,
                             ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
-                            v_buf);
+                            v_buf, /*is_v_side=*/true);
             }
         }
     }
@@ -1215,15 +1255,38 @@ void llama_kv_cache::tq_flush_pending_() {
         __func__, n_tokens_flushed,
         tot_k, ks.hot_tokens, ks.cold_tokens, ks.compression_ratio,
         tot_v, vs.hot_tokens, vs.cold_tokens, vs.compression_ratio);
+
+    // Sprint 4c step 3c-1: report validation stats when they cross the
+    // reporting threshold. Reset running totals after each report so
+    // long runs don't let rare-but-bad outliers get masked by averaging
+    // against a huge sample.
+    if (tq_validate_ && tq_validate_count_k_ >= tq_validate_report_every_) {
+        const double mean_k = tq_validate_sum_cos_k_ / tq_validate_count_k_;
+        LLAMA_LOG_INFO(
+            "%s: TQ validate K: mean cos = %.6f, min cos = %.6f over "
+            "%d round-trips\n",
+            __func__, mean_k, tq_validate_min_cos_k_, tq_validate_count_k_);
+        tq_validate_count_k_   = 0;
+        tq_validate_sum_cos_k_ = 0.0;
+        tq_validate_min_cos_k_ = 1.0f;
+    }
+    if (tq_validate_ && tq_validate_count_v_ >= tq_validate_report_every_) {
+        const double mean_v = tq_validate_sum_cos_v_ / tq_validate_count_v_;
+        LLAMA_LOG_INFO(
+            "%s: TQ validate V: mean cos = %.6f, min cos = %.6f over "
+            "%d round-trips\n",
+            __func__, mean_v, tq_validate_min_cos_v_, tq_validate_count_v_);
+        tq_validate_count_v_   = 0;
+        tq_validate_sum_cos_v_ = 0.0;
+        tq_validate_min_cos_v_ = 1.0f;
+    }
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
-    // Sprint 4c step 2b: flush the previous ubatch's observations
-    // before admitting this one. By now, the forward pass that
-    // populated those slots has completed.
-    if (is_tq()) {
-        tq_flush_pending_();
-    }
+    // Sprint 4c step 3c-1: pre-compute flush was removed (it raced
+    // with async graph compute). The flush now runs from post_compute()
+    // after llama_context::decode() has received a successful
+    // process_ubatch() return.
 
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty

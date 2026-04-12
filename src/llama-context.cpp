@@ -1823,6 +1823,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         n_outputs_prev += n_outputs;
+
+        // Sprint 4c step 3c-1: hook for memory modules that need to
+        // observe the fp16 cache AFTER compute has landed the ubatch's
+        // K/V values. Default is a no-op; llama_kv_cache overrides to
+        // drain its TurboQuant observation queue. Runs here, not in
+        // mctx->apply()/prepare(), because those fire pre-compute.
+        if (memory) {
+            memory->post_compute();
+        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith

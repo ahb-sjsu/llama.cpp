@@ -825,6 +825,109 @@ static void test_materialize_all_bit_widths() {
 }
 
 // -------------------------------------------------------------------- //
+// 10. Push-readback round-trip semantics (Sprint 4c step 3c-1)         //
+//                                                                       //
+// The runtime validation in llama_kv_cache relies on exactly this      //
+// invariant: the last-added token can be read back from tiered_cache   //
+// via read_token_k/v and the cosine against what we pushed in is 1.0  //
+// for hot tokens and meets the per-bit threshold for cold tokens.     //
+// -------------------------------------------------------------------- //
+
+static void test_push_readback_last_token_hot() {
+    std::printf("test_push_readback_last_token_hot\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 32;
+    cfg.hot_window = 8;  // big enough that no eviction occurs
+    cfg.cold_bits  = BITS_3;
+    tiered_cache cache(cfg);
+
+    std::vector<float> push_buf, readback_buf;
+    for (int t = 0; t < 4; ++t) {
+        make_token(t, cfg, push_buf, /*v=*/readback_buf);
+        // Use same buf for K and V here — the readback test is per-side.
+        cache.add_token(push_buf.data(), push_buf.data());
+        const int last_pos = cache.n_tokens() - 1;
+        cache.read_token_k(last_pos, readback_buf);
+        const int n = cfg.n_kv_heads * cfg.head_dim;
+        float c = cosine_similarity(
+            push_buf.data(), readback_buf.data(), n);
+        CHECK(c >= 0.99999f,
+            "hot push-readback: cos = 1.0 up to fp32 storage rounding");
+    }
+}
+
+static void test_push_readback_last_token_cold_path() {
+    std::printf("test_push_readback_last_token_cold_path\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 128;
+    cfg.hot_window = 2;
+    cfg.cold_bits  = BITS_3;
+    tiered_cache cache(cfg);
+
+    // After adding > hot_window tokens, the most recently added still
+    // sits in hot (exact), but older ones evicted to cold will show
+    // compression loss if we happen to read those instead.
+    std::vector<float> push_buf, rb_k;
+    std::vector<std::vector<float>> all;
+    for (int t = 0; t < 8; ++t) {
+        make_token(t, cfg, push_buf, rb_k);
+        cache.add_token(push_buf.data(), push_buf.data());
+        all.push_back(push_buf);
+    }
+    CHECK(cache.n_cold_tokens() == 6, "6 cold");
+    CHECK(cache.n_hot_tokens()  == 2, "2 hot");
+
+    // Read back the last-added (hot): must be exact.
+    cache.read_token_k(cache.n_tokens() - 1, rb_k);
+    float c_hot = cosine_similarity(
+        all.back().data(), rb_k.data(), cfg.head_dim);
+    CHECK(c_hot >= 0.99999f, "hot readback still exact after cold evictions");
+
+    // Read back oldest (cold): should meet 3-bit threshold.
+    cache.read_token_k(0, rb_k);
+    float c_cold = cosine_similarity(
+        all[0].data(), rb_k.data(), cfg.head_dim);
+    std::printf("  cold readback cos = %.4f\n", c_cold);
+    CHECK(c_cold > 0.93f, "cold readback above 3-bit threshold");
+}
+
+static void test_push_readback_independent_k_and_v() {
+    // The runtime validation pushes the same buf for K and V (since
+    // our per-layer tiered_cache stores both sides with the same
+    // value — one side is wasted). This test pins that behaviour so a
+    // future optimization doesn't silently break the runtime check.
+    std::printf("test_push_readback_independent_k_and_v\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 16;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+
+    std::vector<float> k_side(cfg.head_dim), v_side(cfg.head_dim);
+    for (int i = 0; i < cfg.head_dim; ++i) {
+        k_side[i] =  (float) i;
+        v_side[i] = -(float) i;
+    }
+    cache.add_token(k_side.data(), v_side.data());
+    const int last = cache.n_tokens() - 1;
+
+    std::vector<float> rb;
+    cache.read_token_k(last, rb);
+    for (int i = 0; i < cfg.head_dim; ++i) {
+        CHECK_NEAR(rb[i], k_side[i], 1e-6f, "K readback matches K push");
+    }
+    cache.read_token_v(last, rb);
+    for (int i = 0; i < cfg.head_dim; ++i) {
+        CHECK_NEAR(rb[i], v_side[i], 1e-6f, "V readback matches V push");
+    }
+}
+
+// -------------------------------------------------------------------- //
 // Entry point                                                           //
 // -------------------------------------------------------------------- //
 
@@ -847,6 +950,10 @@ int main() {
     test_materialize_all_cold();
     test_materialize_mixed_boundary();
     test_materialize_all_bit_widths();
+    // Sprint 4c step 3c-1: round-trip semantics used by runtime validation
+    test_push_readback_last_token_hot();
+    test_push_readback_last_token_cold_path();
+    test_push_readback_independent_k_and_v();
 
     std::printf("\n=== %d / %d checks passed ===\n",
         n_total - n_failed, n_total);

@@ -145,6 +145,10 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // Sprint 4c step 3c-1: post-compute hook. Flushes TQ observation
+    // queue; safe to call on non-TQ caches (no-op).
+    void post_compute() override;
+
     //
     // llama_kv_cache specific API
     //
@@ -337,6 +341,22 @@ private:
     std::vector<pending_tq_obs> tq_pending_;
 
     void tq_flush_pending_();   // defined in llama-kv-cache.cpp
+
+    // Sprint 4c step 3c-1: opt-in runtime self-consistency validation.
+    // When LLAMA_TQ_VALIDATE=1 was set at construction, tq_flush_pending_
+    // reads each just-added token back via tiered_cache::read_token_k/v
+    // and compares to the fp32 buffer we pushed. For hot tokens this
+    // must be exact (cos = 1.0 up to fp16 rounding); cold tokens reflect
+    // per-bit compression loss. Accumulated stats are reported when
+    // tq_validate_count_k/v_ cross tq_validate_report_every_ threshold.
+    bool     tq_validate_ = false;
+    int      tq_validate_report_every_ = 64;
+    int      tq_validate_count_k_      = 0;
+    int      tq_validate_count_v_      = 0;
+    double   tq_validate_sum_cos_k_    = 0.0;
+    double   tq_validate_sum_cos_v_    = 0.0;
+    float    tq_validate_min_cos_k_    = 1.0f;
+    float    tq_validate_min_cos_v_    = 1.0f;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

@@ -72,6 +72,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             hparams.n_swa, hparams.swa_type, filter_swa, reuse);
 }
 
+void llama_kv_cache_iswa::post_compute() {
+    kv_base->post_compute();
+    kv_swa ->post_compute();
+}
+
 void llama_kv_cache_iswa::clear(bool data) {
     kv_base->clear(data);
     kv_swa ->clear(data);

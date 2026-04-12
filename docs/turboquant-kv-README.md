@@ -121,6 +121,50 @@ llama_kv_cache: TurboQuant shadow caches allocated (tq_kv3/tq_kv3):
 tq_flush_pending_: flushed 30 tokens -> K=34 (hot=4 cold=30 ratio=3.11x) ...
 ```
 
+## Differential benchmark (`scripts/benchmark-tq-kv.py`)
+
+Runs llama-cli against the same prompt with different cache types and
+emits a markdown comparison table:
+
+```bash
+python3 scripts/benchmark-tq-kv.py \
+    --llama-cli build-cuda/bin/llama-cli \
+    --model     /path/to/model.gguf \
+    --prompt    "hi" --n 16 \
+    --hot-window 4 --validate \
+    --configs f16 tq_kv4 tq_kv3 tq_kv2
+```
+
+Sample output (Qwen2.5-0.5B, CPU, hot_window=4):
+
+| Config | Prompt tok/s | Gen tok/s | KV MiB | Δ Gen % | Observed compression     | Validate cos (K) |
+|--------|-------------:|----------:|-------:|--------:|--------------------------|------------------|
+| `f16`    | 130.53 | 54.25 | 384.00 | +0.00%  | —                        | —                |
+| `tq_kv4` | 110.97 | 41.20 | 384.00 | -24.06% | K=2.71× V=2.71× (cold_max=74) | 1.000000 mean/min |
+| `tq_kv3` | 110.49 | 41.34 | 384.00 | -23.80% | K=3.22× V=3.22× (cold_max=74) | 1.000000 mean/min |
+| `tq_kv2` | 109.21 | 33.99 | 384.00 | -37.35% | K=3.99× V=3.99× (cold_max=74) | 1.000000 mean/min |
+
+**What the numbers mean today:**
+
+- *KV MiB unchanged* — the fp16 backbone is still full size; Step 3c-2
+  shrinks it and wires reads through the tiered cache, at which point
+  this column shows real savings.
+- *Gen tok/s slower on TQ* — the observe path + fp16↔fp32 conversion
+  per token per layer adds CPU work. When the read path flips in
+  Step 3c-2, the fp16 backbone shrinks and most of the observation
+  overhead goes with it.
+- *Observed compression* — the tiered_cache internals: e.g. `tq_kv3`
+  reports 3.22× compression on the cold tier during this run. That is
+  the ceiling for Step 3c-2's VRAM savings (adjusted for hot_window).
+- *Validate cos = 1.0* — the runtime push/readback round-trip over 96+
+  samples confirms the observed K/V data matches what the fp16 cache
+  contains. This is the correctness gate for Step 3c-2.
+- *Sampled token agreement = 0.0% disagreement* — same generated tokens
+  across all four configs on this prompt.
+
+The script exits non-zero on (a) any crashed run or (b) sampled-token
+disagreement above `--max-disagreement-frac` (default 10%).
+
 ## Tiered cache (Sprint 4)
 
 [`src/llama-kv-tiered.h`](../src/llama-kv-tiered.h) provides
@@ -202,7 +246,8 @@ After CUDA kernels land:
   - [x] **Step 2b** — queue + flush observe in `apply_ubatch`/`prepare` (writes now populate tiered_cache)
   - [x] **Step 3a** — env var `LLAMA_TQ_HOT_WINDOW` + per-flush stats (cold tier is populated on real inference data)
   - [x] **Step 3b** — `tq_materialize_fp16_k/v` API + `tiered_cache::read_token_k/v`, `materialize_fp16_rows`, with per-path unit tests (hot, cold, mixed boundary, all bit widths, empty, out-of-range)
-  - [ ] Step 3c — wire `tq_materialize_fp16_*` into `build_attn` and shrink the fp16 backbone → actual VRAM savings
+  - [x] **Step 3c-1** — runtime push/readback round-trip validation via `LLAMA_TQ_VALIDATE=1`, plus **post-compute hook** that fixes a pre-compute race in the observe path (would have broken 3c-2)
+  - [ ] Step 3c-2 — wire `tq_materialize_fp16_*` into `build_attn` and shrink the fp16 backbone → actual VRAM savings
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

@@ -70,6 +70,9 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    // Sprint 4c step 3c-1: delegate post-compute hook to both inner caches.
+    void post_compute() override;
+
 private:
     const llama_hparams & hparams;
 
