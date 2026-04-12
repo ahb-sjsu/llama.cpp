@@ -1,0 +1,79 @@
+# CI workflow for TurboQuant KV cache compression.
+# Runs only when scaffolding files change — fast feedback on the
+# feature branch without waiting for the full build matrix.
+
+name: TurboQuant KV CI
+
+on:
+  push:
+    branches: [feature/turboquant-kv-cache]
+    paths:
+      - 'src/llama-kv-turboquant.*'
+      - 'tests/test-tq-kv.cpp'
+      - 'tests/CMakeLists.txt'
+      - 'docs/turboquant-kv-design.md'
+      - '.github/workflows/turboquant-kv.yml'
+  pull_request:
+    paths:
+      - 'src/llama-kv-turboquant.*'
+      - 'tests/test-tq-kv.cpp'
+
+jobs:
+  build-and-test:
+    name: Build + run test-tq-kv
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_CURL=OFF
+
+      - name: Build test-tq-kv
+        run: |
+          cd build
+          cmake --build . --target test-tq-kv -j 2
+
+      - name: Run test-tq-kv
+        run: |
+          cd build
+          ./bin/test-tq-kv
+
+  lint:
+    name: Lint (clang-format check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting on TQ KV files
+        run: |
+          # llama.cpp doesn't enforce a global style — we just check
+          # that the TQ KV files don't have trailing whitespace or
+          # tabs (project conventions).
+          for f in src/llama-kv-turboquant.h src/llama-kv-turboquant.cpp tests/test-tq-kv.cpp; do
+            if grep -P '\t' "$f"; then
+              echo "Tabs found in $f — use spaces"
+              exit 1
+            fi
+            if grep -P ' $' "$f"; then
+              echo "Trailing whitespace in $f"
+              exit 1
+            fi
+          done
+          echo "All TQ KV files passed style checks"
