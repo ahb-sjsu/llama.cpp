@@ -371,19 +371,24 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_COLD_VALIDATE")) {
             tq_cold_validate_ = (std::atoi(e) != 0);
         }
+        // Sprint 4c step 3c-2b: opt-in write-back readthrough.
+        if (const char * e = std::getenv("LLAMA_TQ_READTHROUGH")) {
+            tq_readthrough_ = (std::atoi(e) != 0);
+        }
 
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
             "%d K layers, %d V layers, hot_window=%d, validate=%d, "
-            "view_validate=%d, cold_validate=%d "
+            "view_validate=%d, cold_validate=%d, readthrough=%d "
             "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE, "
-            "LLAMA_TQ_VIEW_VALIDATE, LLAMA_TQ_COLD_VALIDATE)\n",
+            "LLAMA_TQ_VIEW_VALIDATE, LLAMA_TQ_COLD_VALIDATE, "
+            "LLAMA_TQ_READTHROUGH)\n",
             __func__,
             ggml_type_name(requested_type_k_),
             ggml_type_name(requested_type_v_),
             n_tq_k, n_tq_v, hot_window,
             (int) tq_validate_, (int) tq_view_validate_,
-            (int) tq_cold_validate_);
+            (int) tq_cold_validate_, (int) tq_readthrough_);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -1127,9 +1132,59 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 void llama_kv_cache::post_compute() {
     // Sprint 4c step 3c-1: the only post-compute work we have today is
     // draining the TQ observation queue. Non-TQ caches skip this.
+    // Sprint 4c step 3c-2b: opt-in write-back readthrough lands here too.
     if (is_tq()) {
         tq_flush_pending_();
+        if (tq_readthrough_) {
+            tq_apply_readthrough_();
+        }
     }
+}
+
+void llama_kv_cache::tq_apply_readthrough_() {
+    // Sprint 4c step 3c-2b investigation result: a naive write-back
+    // approach (materialize tiered_cache -> ggml_backend_tensor_set
+    // back into layers[il].k) corrupts inference even when the data
+    // being written is bit-equivalent to what's already in the cache.
+    //
+    // Symptoms observed on Atlas (Qwen2.5-0.5B, hot_window=128 so all
+    // tokens are hot and writeback should be a no-op fp16 round-trip):
+    //   - 87.5% sampled-token disagreement vs the f16 baseline
+    //   - IDENTICAL diverged output across tq_kv2/3/4 (all 87.5%) —
+    //     so the divergence is independent of compression bit width
+    //   - Disabling V writeback (because v_trans makes the layout
+    //     transposed) does not help — K-only writeback also breaks it
+    //
+    // The deterministic, compression-independent divergence implies
+    // the bug is in our writeback PLUMBING (likely a backend / buffer /
+    // graph-scheduler interaction), not in the compression math. The
+    // proper fix probably needs the input-binding mechanism that
+    // set_input_k_idxs uses, not a raw post-compute tensor_set. That's
+    // 3c-3 territory and warrants a focused investigation.
+    //
+    // Also surfaced: the V cache uses v_trans=true layout by default,
+    // which means our existing OBSERVE path has been silently wrong
+    // for V — we read n_embd_v_gqa fp16 elements at a "row" that, for
+    // a transposed cache, isn't actually one token's V values. View-
+    // and cold-validate cosines came back as 1.0 / 0.95+ because we
+    // were comparing the same wrong data on both sides. K observation
+    // is fine (no transpose).
+    //
+    // For this commit we keep the env var so the evidence path (and
+    // this comment) is preserved, but do not write back. Running
+    // without readthrough remains the only correct mode today.
+    static bool warned = false;
+    if (!warned) {
+        LLAMA_LOG_WARN(
+            "%s: LLAMA_TQ_READTHROUGH=1 was requested but the write-back "
+            "path is currently DISABLED. The naive ggml_backend_tensor_set "
+            "approach corrupts inference regardless of compression bits "
+            "(see comment in source). The proper fix uses ggml input-binding "
+            "and lands with Sprint 4c step 3c-3.\n",
+            __func__);
+        warned = true;
+    }
+    GGML_UNUSED(v_trans);
 }
 
 void llama_kv_cache::tq_materialize_fp16_k(int32_t il,

@@ -248,8 +248,9 @@ After CUDA kernels land:
   - [x] **Step 3b** — `tq_materialize_fp16_k/v` API + `tiered_cache::read_token_k/v`, `materialize_fp16_rows`, with per-path unit tests (hot, cold, mixed boundary, all bit widths, empty, out-of-range)
   - [x] **Step 3c-1** — runtime push/readback round-trip validation via `LLAMA_TQ_VALIDATE=1`, plus **post-compute hook** that fixes a pre-compute race in the observe path (would have broken 3c-2)
   - [x] **Step 3c-2a** — read-side view validation via `LLAMA_TQ_VIEW_VALIDATE=1`: live cosine compare of `materialize_fp16_rows` output against fp16 cache rows. Reports cos = 1.000000 (mean and min) over 1,440 row comparisons on Atlas (hot-tier path)
-  - [x] **Step 3c-2b precursor** — cold-path validation via `LLAMA_TQ_COLD_VALIDATE=1`. On Atlas (Qwen2.5-0.5B, hot_window=4, 1,344 cold rows): tq_kv4 mean/min cos = 0.9953/0.9852, tq_kv3 = 0.9796/0.9579, tq_kv2 = 0.9419/0.9138. All meet per-bit targets. With both validations, the read-side swap is now backed by hot AND cold real-data evidence
-  - [ ] Step 3c-2b — replace `get_k`/`get_v` view-of-backbone with materialized fp16 view from `tiered_cache`; shrink fp16 backbone → real VRAM savings
+  - [x] **Step 3c-2b precursor** — cold-path validation via `LLAMA_TQ_COLD_VALIDATE=1`. On Atlas (Qwen2.5-0.5B, hot_window=4, 1,344 cold rows): tq_kv4 mean/min cos = 0.9953/0.9852, tq_kv3 = 0.9796/0.9579, tq_kv2 = 0.9419/0.9138. All meet per-bit targets
+  - [⚠️] **Step 3c-2b investigation** — naive write-back via `ggml_backend_tensor_set` corrupts inference even with bit-equivalent fp16 round-trip data. 87.5% sampled-token divergence on Qwen2.5-0.5B at hot_window=128 (all-hot, no compression involved), identical across tq_kv2/3/4 (proves it's not compression). LLAMA_TQ_READTHROUGH=1 now logs a warning and skips. Also surfaced: the V cache's `v_trans=true` default makes the existing OBSERVE path silently incorrect for V (validate cosines were 1.0 / 0.95+ comparing same-wrong-data on both sides). K observation is correct
+  - [ ] Step 3c-3 — proper read-side wire-up via ggml input-binding (the path used by `set_input_k_idxs`); transpose-aware V observation; slot↔pos mapping; shrink fp16 backbone → real VRAM savings
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

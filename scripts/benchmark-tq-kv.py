@@ -159,7 +159,8 @@ def run_one(llama_cli: Path,
             timeout_s: int,
             validate: bool,
             view_validate: bool = False,
-            cold_validate: bool = False) -> RunResult:
+            cold_validate: bool = False,
+            readthrough: bool = False) -> RunResult:
     cmd = [
         str(llama_cli),
         "-m", str(model),
@@ -185,6 +186,8 @@ def run_one(llama_cli: Path,
         env["LLAMA_TQ_VIEW_VALIDATE"] = "1"
     if cold_validate:
         env["LLAMA_TQ_COLD_VALIDATE"] = "1"
+    if readthrough:
+        env["LLAMA_TQ_READTHROUGH"] = "1"
 
     # llama-cli in this tree has a quirk: after `-n` tokens it emits
     # the perf stats and a short idle-prompt loop that can print for a
@@ -334,6 +337,10 @@ def main() -> int:
                     help="enable LLAMA_TQ_VIEW_VALIDATE for TQ configs")
     ap.add_argument("--cold-validate", action="store_true",
                     help="enable LLAMA_TQ_COLD_VALIDATE for TQ configs")
+    ap.add_argument("--readthrough", action="store_true",
+                    help="enable LLAMA_TQ_READTHROUGH for TQ configs "
+                         "(write decompressed data back into the fp16 "
+                         "cache; attention then reads through tiered_cache)")
     ap.add_argument("--max-disagreement-frac", type=float, default=0.1)
     args = ap.parse_args()
 
@@ -350,7 +357,7 @@ def main() -> int:
         r = run_one(args.llama_cli, args.model, cfg, args.prompt, args.n,
                     args.hot_window, args.threads, args.ngl,
                     args.timeout_s, args.validate, args.view_validate,
-                    args.cold_validate)
+                    args.cold_validate, args.readthrough)
         results.append(r)
         if r.returncode != 0:
             print(f"[benchmark] {cfg} FAILED (rc={r.returncode}):", file=sys.stderr)

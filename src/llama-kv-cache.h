@@ -389,6 +389,23 @@ private:
     float    tq_cold_validate_min_cos_k_ = 1.0f;
     float    tq_cold_validate_min_cos_v_ = 1.0f;
 
+    // Sprint 4c step 3c-2b: opt-in write-back readthrough. Enabled by
+    // LLAMA_TQ_READTHROUGH=1. After each post-compute flush, we
+    // materialize all observed positions from tiered_cache and
+    // ggml_backend_tensor_set them back into layers[il].k/v. Attention
+    // on the *next* forward pass therefore reads decompressed-fp16
+    // data (within the per-bit cosine bound) — exactly what step 3c-3
+    // will see once the backbone shrinks. Lets us measure end-to-end
+    // logit divergence before committing to memory layout changes.
+    //
+    // Limitations: this assumes n_stream == 1 and that tiered_cache
+    // positions correspond 1:1 to slot indices (i.e. no seq_rm has
+    // shuffled them). Both are true for plain decode loops; complex
+    // sampling like beam search or seq_rm-driven workflows would need
+    // an explicit slot->pos mapping (deferred to 3c-3).
+    bool     tq_readthrough_ = false;
+    void     tq_apply_readthrough_();
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
