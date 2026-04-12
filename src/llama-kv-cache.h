@@ -374,6 +374,21 @@ private:
     float    tq_view_validate_min_cos_k_ = 1.0f;
     float    tq_view_validate_min_cos_v_ = 1.0f;
 
+    // Sprint 4c step 3c-2b precursor: cold-path runtime validation. Opt
+    // in via LLAMA_TQ_COLD_VALIDATE=1. After each flush, for any pending
+    // observation whose tiered_cache position has already crossed into
+    // the cold tier (because the flush itself overflowed the hot
+    // window), we compare the cold-tier-decompressed bytes against the
+    // fp16 cache row at the same (slot, stream). This is the missing
+    // half of the read-side gate: 3c-2a covers hot, this covers cold.
+    bool     tq_cold_validate_ = false;
+    int      tq_cold_validate_count_k_   = 0;
+    int      tq_cold_validate_count_v_   = 0;
+    double   tq_cold_validate_sum_cos_k_ = 0.0;
+    double   tq_cold_validate_sum_cos_v_ = 0.0;
+    float    tq_cold_validate_min_cos_k_ = 1.0f;
+    float    tq_cold_validate_min_cos_v_ = 1.0f;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 

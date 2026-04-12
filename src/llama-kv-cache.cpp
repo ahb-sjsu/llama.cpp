@@ -367,17 +367,23 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_VIEW_VALIDATE")) {
             tq_view_validate_ = (std::atoi(e) != 0);
         }
+        // Sprint 4c step 3c-2b precursor: opt-in cold-path validation.
+        if (const char * e = std::getenv("LLAMA_TQ_COLD_VALIDATE")) {
+            tq_cold_validate_ = (std::atoi(e) != 0);
+        }
 
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
             "%d K layers, %d V layers, hot_window=%d, validate=%d, "
-            "view_validate=%d "
-            "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE, LLAMA_TQ_VIEW_VALIDATE)\n",
+            "view_validate=%d, cold_validate=%d "
+            "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE, "
+            "LLAMA_TQ_VIEW_VALIDATE, LLAMA_TQ_COLD_VALIDATE)\n",
             __func__,
             ggml_type_name(requested_type_k_),
             ggml_type_name(requested_type_v_),
             n_tq_k, n_tq_v, hot_window,
-            (int) tq_validate_, (int) tq_view_validate_);
+            (int) tq_validate_, (int) tq_view_validate_,
+            (int) tq_cold_validate_);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -1168,6 +1174,21 @@ void llama_kv_cache::tq_flush_pending_() {
     // Temp fp32 buffer reused across tokens. Sized for the largest layer.
     std::vector<float> k_buf, v_buf;
 
+    // Sprint 4c step 3c-2b precursor: tracking for the cold-path
+    // validation pass that runs after this flush completes. For each
+    // observed (layer, side, slot, stream) we record the tiered_cache
+    // pos the token landed at; afterwards we revisit any whose pos has
+    // since fallen into the cold tier (because subsequent pushes within
+    // this same flush evicted them) and compare cold-decompressed
+    // bytes to the fp16 cache row at the original (slot, stream).
+    struct cold_check_t {
+        uint32_t idx;
+        uint32_t strm;
+        int      tq_pos;
+    };
+    std::vector<std::vector<cold_check_t>> cold_check_k(layers.size());
+    std::vector<std::vector<cold_check_t>> cold_check_v(layers.size());
+
     for (const auto & pend : tq_pending_) {
         const size_t n = pend.idxs.size();
         for (size_t t = 0; t < n; ++t) {
@@ -1200,7 +1221,15 @@ void llama_kv_cache::tq_flush_pending_() {
                     // (the other side is handled by its own call — the
                     // unused half is benign but wasted compute, which
                     // step 3c-2 addresses along with the read wire-up).
+                    const int tq_pos_pushed = tq->n_tokens();   // 0-indexed pos this push will land at
                     tq->add_token(buf.data(), buf.data());
+
+                    // Sprint 4c step 3c-2b precursor: record for cold check.
+                    if (tq_cold_validate_) {
+                        cold_check_t cc{idx, strm, tq_pos_pushed};
+                        if (is_v_side) cold_check_v[ikv].push_back(cc);
+                        else           cold_check_k[ikv].push_back(cc);
+                    }
 
                     // Sprint 4c step 3c-1: post-push round-trip check.
                     if (tq_validate_) {
@@ -1284,6 +1313,75 @@ void llama_kv_cache::tq_flush_pending_() {
 
     tq_pending_.clear();
 
+    // Sprint 4c step 3c-2b precursor: cold-path validation pass. For
+    // each just-pushed token whose tiered_cache pos has since fallen
+    // into the cold tier, materialize from cold and compare to the
+    // fp16 cache row at the original (slot, stream). This is the
+    // missing-half evidence the read-side swap (3c-2b proper) needs.
+    if (tq_cold_validate_) {
+        auto cold_check_one =
+            [&](ggml_tensor * cache,
+                llama_kv_tq::tiered_cache * tq,
+                const std::vector<cold_check_t> & list,
+                bool is_v_side)
+        {
+            if (!cache || !tq) return;
+            const int n_cold = tq->n_cold_tokens();
+            const size_t n_elem = cache->ne[0];
+            const size_t row_bytes = cache->nb[1];
+            const size_t strm_bytes = cache->nb[2];
+            for (const auto & cc : list) {
+                if (cc.tq_pos >= n_cold) continue;  // still hot, skip
+                // Read fp16 backbone row.
+                std::vector<uint16_t> backbone_fp16(n_elem);
+                const size_t offset = (size_t) cc.strm * strm_bytes
+                                    + (size_t) cc.idx  * row_bytes;
+                ggml_backend_tensor_get(
+                    cache, backbone_fp16.data(), offset,
+                    n_elem * sizeof(uint16_t));
+                // Materialize cold.
+                std::vector<uint16_t> mat_fp16;
+                tq->materialize_fp16_rows(
+                    cc.tq_pos, /*n_positions=*/1, is_v_side, mat_fp16);
+                // Cosine in fp32 space.
+                std::vector<float> a(n_elem), b(n_elem);
+                ggml_fp16_to_fp32_row(
+                    (const ggml_fp16_t *) backbone_fp16.data(),
+                    a.data(), n_elem);
+                ggml_fp16_to_fp32_row(
+                    (const ggml_fp16_t *) mat_fp16.data(),
+                    b.data(), n_elem);
+                double dot = 0, na = 0, nb = 0;
+                for (size_t i = 0; i < n_elem; ++i) {
+                    dot += (double) a[i] * b[i];
+                    na  += (double) a[i] * a[i];
+                    nb  += (double) b[i] * b[i];
+                }
+                const double denom = std::sqrt(na) * std::sqrt(nb);
+                const float cos = denom > 1e-12
+                    ? (float) (dot / denom) : 1.0f;
+                if (is_v_side) {
+                    tq_cold_validate_sum_cos_v_ += cos;
+                    tq_cold_validate_count_v_++;
+                    if (cos < tq_cold_validate_min_cos_v_) tq_cold_validate_min_cos_v_ = cos;
+                } else {
+                    tq_cold_validate_sum_cos_k_ += cos;
+                    tq_cold_validate_count_k_++;
+                    if (cos < tq_cold_validate_min_cos_k_) tq_cold_validate_min_cos_k_ = cos;
+                }
+            }
+        };
+
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            cold_check_one(layers[ikv].k,
+                ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
+                cold_check_k[ikv], /*is_v_side=*/false);
+            cold_check_one(layers[ikv].v,
+                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                cold_check_v[ikv], /*is_v_side=*/true);
+        }
+    }
+
     // Report running totals and memory stats once per flush. We witness
     // against the first K and first V layer — all TQ-enabled layers
     // accumulate in lockstep, so these numbers are representative.
@@ -1318,6 +1416,31 @@ void llama_kv_cache::tq_flush_pending_() {
         tq_validate_sum_cos_k_ = 0.0;
         tq_validate_min_cos_k_ = 1.0f;
     }
+    // Cold-path validation totals (Sprint 4c step 3c-2b precursor).
+    // Same threshold + reset semantics as the other validators.
+    if (tq_cold_validate_ && tq_cold_validate_count_k_ >= tq_validate_report_every_) {
+        const double mean_k = tq_cold_validate_sum_cos_k_ / tq_cold_validate_count_k_;
+        LLAMA_LOG_INFO(
+            "%s: TQ cold-validate K: mean cos = %.6f, min cos = %.6f over "
+            "%d cold-tier rows (decompress vs fp16 cache)\n",
+            __func__, mean_k, tq_cold_validate_min_cos_k_,
+            tq_cold_validate_count_k_);
+        tq_cold_validate_count_k_   = 0;
+        tq_cold_validate_sum_cos_k_ = 0.0;
+        tq_cold_validate_min_cos_k_ = 1.0f;
+    }
+    if (tq_cold_validate_ && tq_cold_validate_count_v_ >= tq_validate_report_every_) {
+        const double mean_v = tq_cold_validate_sum_cos_v_ / tq_cold_validate_count_v_;
+        LLAMA_LOG_INFO(
+            "%s: TQ cold-validate V: mean cos = %.6f, min cos = %.6f over "
+            "%d cold-tier rows (decompress vs fp16 cache)\n",
+            __func__, mean_v, tq_cold_validate_min_cos_v_,
+            tq_cold_validate_count_v_);
+        tq_cold_validate_count_v_   = 0;
+        tq_cold_validate_sum_cos_v_ = 0.0;
+        tq_cold_validate_min_cos_v_ = 1.0f;
+    }
+
     // View validation totals (Sprint 4c step 3c-2a). Same threshold
     // logic as push/readback validation above.
     if (tq_view_validate_ && tq_view_validate_count_k_ >= tq_validate_report_every_) {
