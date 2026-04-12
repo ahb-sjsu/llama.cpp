@@ -231,8 +231,11 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // Sprint 4c step 3c-5b: allocate backbone at shrunk size if requested.
+        // View tensor (below) keeps full kv_size so attention reads unaffected.
+        const uint32_t backbone_slots = tq_shrunk_ ? tq_shrink_backbone_size_ : kv_size;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, backbone_slots, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, backbone_slots, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -259,8 +262,10 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            // Sprint 4c step 3c-5b: views use the actual backbone size
+            // which may be smaller than kv_size when shrunk.
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, backbone_slots, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, backbone_slots, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -400,6 +405,27 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_VIEW_BIND")) {
             tq_view_bind_ = (std::atoi(e) != 0);
             if (tq_view_bind_) tq_readthrough_ = true;
+        }
+        // Sprint 4c step 3c-5b: shrink backbone to a small ring. Requires
+        // view-bind so attention reads from the view tensor instead of
+        // the tiny backbone. Values below 32 clamp to 32 to avoid
+        // pathologies during prompt processing.
+        if (const char * e = std::getenv("LLAMA_TQ_SHRINK_BACKBONE")) {
+            long v = std::atol(e);
+            if (v > 0) {
+                if (v < 32) v = 32;
+                if ((uint32_t) v < kv_size) {
+                    tq_shrink_backbone_size_ = (uint32_t) v;
+                    tq_shrunk_ = true;
+                    if (!tq_view_bind_) {
+                        LLAMA_LOG_WARN(
+                            "%s: LLAMA_TQ_SHRINK_BACKBONE requires "
+                            "LLAMA_TQ_VIEW_BIND — enabling it.\n", __func__);
+                        tq_view_bind_ = true;
+                        tq_readthrough_ = true;
+                    }
+                }
+            }
         }
 
         // Sprint 4c step 3c-2b proper fix: allocate the slot→TC-position
@@ -1605,6 +1631,10 @@ void llama_kv_cache::tq_flush_pending_() {
                     const size_t strm_bytes = cache->nb[2];
                     const size_t kv_size_   = cache->ne[1];
                     const size_t fp16_sz    = sizeof(uint16_t);
+                    // Sprint 4c step 3c-5b: when the backbone is shrunk,
+                    // data sits at `idx % kv_size_` in the ring. The
+                    // modulo auto-handles abs idx >= kv_size_.
+                    const uint32_t read_idx = tq_shrunk_ ? (idx % kv_size_) : idx;
                     std::vector<uint16_t> fp16_buf(n_elem);
                     if (is_v_side && v_trans) {
                         // Sprint 4c step 3c-4: V is stored transposed —
@@ -1614,7 +1644,7 @@ void llama_kv_cache::tq_flush_pending_() {
                         // at strided offsets [(e * kv_size + idx) * 2]
                         // for e in [0, n_embd_v_gqa). Read per-element.
                         const size_t base = (size_t) strm * strm_bytes
-                                          + (size_t) idx  * fp16_sz;
+                                          + (size_t) read_idx * fp16_sz;
                         for (size_t e = 0; e < n_elem; ++e) {
                             const size_t off = base + e * kv_size_ * fp16_sz;
                             ggml_backend_tensor_get(
@@ -1624,7 +1654,7 @@ void llama_kv_cache::tq_flush_pending_() {
                         // Contiguous row read (K always; V when
                         // v_trans=false, e.g. with --flash-attn).
                         const size_t offset = (size_t) strm * strm_bytes
-                                            + (size_t) idx  * row_bytes;
+                                            + (size_t) read_idx * row_bytes;
                         ggml_backend_tensor_get(
                             cache, fp16_buf.data(), offset,
                             n_elem * fp16_sz);
@@ -2335,11 +2365,17 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    // Sprint 4c step 3c-5b: when backbone is shrunk, remap absolute
+    // slot indices into the ring via modulo. Per-stream base offset
+    // also uses the shrunk size.
+    const uint32_t ring_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        const int64_t offs = sinfo.strm[s]*ring_size;
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            const uint32_t abs_idx = sinfo.idxs[s][i];
+            const uint32_t ring_idx = tq_shrunk_ ? (abs_idx % ring_size) : abs_idx;
+            data[s*sinfo.size() + i] = offs + ring_idx;
         }
     }
 }
@@ -2352,16 +2388,20 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
+        // Sprint 4c step 3c-5b: same ring-modulo remap as K path.
+        const uint32_t ring_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const int64_t offs = sinfo.strm[s]*ring_size;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                const uint32_t abs_idx = sinfo.idxs[s][i];
+                const uint32_t ring_idx = tq_shrunk_ ? (abs_idx % ring_size) : abs_idx;
+                data[s*sinfo.size() + i] = offs + ring_idx;
             }
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = get_size();
+        const int64_t kv_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
@@ -2369,8 +2409,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                const uint32_t abs_idx = sinfo.idxs[s][i];
+                const int64_t ring_idx = tq_shrunk_ ? (abs_idx % kv_size) : abs_idx;
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + ring_idx;
                 }
             }
         }

@@ -420,6 +420,17 @@ private:
     std::vector<ggml_tensor *> tq_view_k_;
     std::vector<ggml_tensor *> tq_view_v_;
 
+    // Sprint 4c step 3c-5b: LLAMA_TQ_SHRINK_BACKBONE=N shrinks the
+    // backbone K/V tensors from [n_embd_gqa, kv_size, n_stream] to
+    // [n_embd_gqa, N, n_stream]. set_input_*_idxs remap absolute slots
+    // into the ring via modulo N. Reads for attention go through the
+    // view tensor (view-bind required). 0 = disabled.
+    uint32_t tq_shrink_backbone_size_ = 0;
+    // True when the backbone tensor's ne[1] != kv_size (derived from
+    // above at ctor time; mirrored here so downstream code can branch
+    // cheaply without re-reading the env var).
+    bool tq_shrunk_ = false;
+
     // Per-stream slot → most-recent tiered_cache position. -1 means never
     // observed (or invalidated by clear/seq_rm). Updated on each observe;
     // overwriting is intentional (slot reuse → latest mapping wins).
