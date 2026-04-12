@@ -1395,6 +1395,11 @@ void llama_kv_cache::tq_apply_readthrough_() {
                     const int32_t tc_pos = slot_map[slot];
                     if (tc_pos < 0) continue;
                     if (tc_pos >= tq->n_tokens()) continue;
+                    // Phase 1A: hot-tier round-trip is identity with the
+                    // fp16 cpy_k already wrote — writing it back is a
+                    // no-op ggml_backend_tensor_set. Skip to save ~25k
+                    // redundant calls per generation step.
+                    if (tc_pos >= tq->n_cold_tokens()) continue;
                     if (is_v_side) tq->read_token_v(tc_pos, rb);
                     else           tq->read_token_k(tc_pos, rb);
                     fp16.resize(rb.size());
