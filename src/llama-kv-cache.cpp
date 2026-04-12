@@ -376,6 +376,13 @@ llama_kv_cache::llama_kv_cache(
             tq_readthrough_ = (std::atoi(e) != 0);
         }
 
+        // Sprint 4c step 3c-2b proper fix: allocate the slot→TC-position
+        // tables if any TQ side is enabled. Sized [n_stream][kv_size]
+        // (small — kv_size for Qwen2.5-0.5B at 32K is ~1MB total per
+        // table per stream). Initialized to -1 (never observed).
+        tq_slot_to_pos_k_.assign(n_stream, std::vector<int32_t>(kv_size, -1));
+        tq_slot_to_pos_v_.assign(n_stream, std::vector<int32_t>(kv_size, -1));
+
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
             "%d K layers, %d V layers, hot_window=%d, validate=%d, "
@@ -447,6 +454,15 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+    }
+
+    // Sprint 4c step 3c-2b: clear() resets all slot bookkeeping;
+    // any TC entry that was tied to a slot is now stale.
+    if (is_tq()) {
+        for (auto & v : tq_slot_to_pos_k_) std::fill(v.begin(), v.end(), -1);
+        for (auto & v : tq_slot_to_pos_v_) std::fill(v.begin(), v.end(), -1);
+        // Also drop any pending observations.
+        tq_pending_.clear();
     }
 }
 
@@ -1199,17 +1215,6 @@ void llama_kv_cache::tq_apply_readthrough_() {
     // For this commit we keep the env var so the evidence path (and
     // this comment) is preserved, but do not write back. Running
     // without readthrough remains the only correct mode today.
-    static bool warned = false;
-    if (!warned) {
-        LLAMA_LOG_WARN(
-            "%s: LLAMA_TQ_READTHROUGH=1 was requested but the write-back "
-            "path is currently DISABLED. The naive ggml_backend_tensor_set "
-            "approach corrupts inference regardless of compression bits "
-            "(see comment in source). The proper fix uses ggml input-binding "
-            "and lands with Sprint 4c step 3c-3.\n",
-            __func__);
-        warned = true;
-    }
     GGML_UNUSED(v_trans);
 
     // Diagnostic mode: LLAMA_TQ_DIAG_WB lets us pin down WHY writeback
@@ -1232,6 +1237,43 @@ void llama_kv_cache::tq_apply_readthrough_() {
             }
         }
         diag_init = true;
+    }
+
+    // Default mode (no diag override): production K writeback via the
+    // slot→TC-position map. V is skipped pending transpose-aware support.
+    // Mirrors the body of diag_mode == 5.
+    if (diag_mode == 0) {
+        std::vector<float> rb;
+        std::vector<uint16_t> fp16;
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            auto * cache = layers[ikv].k;
+            if (!cache || ikv >= tq_k_caches.size() || !tq_k_caches[ikv])
+                continue;
+            auto * tq = tq_k_caches[ikv].get();
+            const size_t n_elem = cache->ne[0];
+            const size_t row_bytes = cache->nb[1];
+            const size_t strm_bytes = cache->nb[2];
+            for (uint32_t strm = 0; strm < tq_slot_to_pos_k_.size(); ++strm) {
+                const auto & slot_map = tq_slot_to_pos_k_[strm];
+                for (uint32_t slot = 0; slot < slot_map.size(); ++slot) {
+                    const int32_t tc_pos = slot_map[slot];
+                    if (tc_pos < 0) continue;
+                    if (tc_pos >= tq->n_tokens()) continue;
+                    tq->read_token_k(tc_pos, rb);
+                    fp16.resize(rb.size());
+                    ggml_fp32_to_fp16_row(
+                        rb.data(),
+                        reinterpret_cast<ggml_fp16_t *>(fp16.data()),
+                        rb.size());
+                    const size_t offset = (size_t) strm * strm_bytes
+                                        + (size_t) slot * row_bytes;
+                    ggml_backend_tensor_set(
+                        cache, fp16.data(), offset,
+                        n_elem * sizeof(uint16_t));
+                }
+            }
+        }
+        return;
     }
 
     if (diag_mode == 1 && !layers.empty() && layers[0].k) {
@@ -1268,21 +1310,40 @@ void llama_kv_cache::tq_apply_readthrough_() {
                 cache, buf.data(), 0, (size_t) n * row_bytes);
         }
     } else if (diag_mode == 5) {
-        // K-only writeback using MATERIALIZE output. Same target as diag 3
-        // but the bytes come from tiered_cache, not from a re-read of the
-        // cache. If diag 3 worked but diag 5 breaks, materialize is
-        // producing different fp16 bytes than what's in the cache (bug
-        // in our fp16 round-trip).
+        // K-only writeback using MATERIALIZE output via the slot→TC map.
+        // For each cache slot whose mapping is valid, write the
+        // corresponding TC position's fp16 data. Handles slot reuse
+        // correctly because the map always points to the latest
+        // observation of that slot.
+        std::vector<float> rb;
+        std::vector<uint16_t> fp16;
         for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
             auto * cache = layers[ikv].k;
             if (!cache || ikv >= tq_k_caches.size() || !tq_k_caches[ikv])
                 continue;
-            const int n = tq_k_caches[ikv]->n_tokens();
-            if (n <= 0) continue;
-            std::vector<uint16_t> mat;
-            tq_k_caches[ikv]->materialize_fp16_rows(0, n, false, mat);
-            ggml_backend_tensor_set(
-                cache, mat.data(), 0, mat.size() * sizeof(uint16_t));
+            auto * tq = tq_k_caches[ikv].get();
+            const size_t n_elem = cache->ne[0];
+            const size_t row_bytes = cache->nb[1];
+            const size_t strm_bytes = cache->nb[2];
+            for (uint32_t strm = 0; strm < tq_slot_to_pos_k_.size(); ++strm) {
+                const auto & slot_map = tq_slot_to_pos_k_[strm];
+                for (uint32_t slot = 0; slot < slot_map.size(); ++slot) {
+                    const int32_t tc_pos = slot_map[slot];
+                    if (tc_pos < 0) continue;
+                    if (tc_pos >= tq->n_tokens()) continue;
+                    tq->read_token_k(tc_pos, rb);
+                    fp16.resize(rb.size());
+                    ggml_fp32_to_fp16_row(
+                        rb.data(),
+                        reinterpret_cast<ggml_fp16_t *>(fp16.data()),
+                        rb.size());
+                    const size_t offset = (size_t) strm * strm_bytes
+                                        + (size_t) slot * row_bytes;
+                    ggml_backend_tensor_set(
+                        cache, fp16.data(), offset,
+                        n_elem * sizeof(uint16_t));
+                }
+            }
         }
     } else if (diag_mode == 6) {
         // Diag 5 minus the conversions: log the byte-diff between
@@ -1462,6 +1523,18 @@ void llama_kv_cache::tq_flush_pending_() {
                     // unused half is benign but wasted compute, which
                     // step 3c-2 addresses along with the read wire-up).
                     const int tq_pos_pushed = tq->n_tokens();   // 0-indexed pos this push will land at
+
+                    // Sprint 4c step 3c-2b: maintain the slot→TC mapping
+                    // for the writeback path. Layer 0 is sufficient: all
+                    // layers' tiered_caches are pushed in lockstep so
+                    // tc_pos at layer 0 equals tc_pos at every layer.
+                    if (ikv == 0) {
+                        if (is_v_side) {
+                            tq_slot_to_pos_v_[strm][idx] = tq_pos_pushed;
+                        } else {
+                            tq_slot_to_pos_k_[strm][idx] = tq_pos_pushed;
+                        }
+                    }
 
                     // Diagnostic 7: log first 4 fp16 values for layer 0 K
                     // at observe time. Compare with diag-6 materialize.

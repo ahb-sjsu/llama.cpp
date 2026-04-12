@@ -406,6 +406,13 @@ private:
     bool     tq_readthrough_ = false;
     void     tq_apply_readthrough_();
 
+    // Per-stream slot → most-recent tiered_cache position. -1 means never
+    // observed (or invalidated by clear/seq_rm). Updated on each observe;
+    // overwriting is intentional (slot reuse → latest mapping wins).
+    // Indexing: tq_slot_to_pos_k_[strm][slot] -> tc_pos.
+    std::vector<std::vector<int32_t>> tq_slot_to_pos_k_;
+    std::vector<std::vector<int32_t>> tq_slot_to_pos_v_;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
