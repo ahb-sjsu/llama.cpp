@@ -237,6 +237,24 @@ llama_kv_cache::llama_kv_cache(
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
+        // Sprint 4c step 3c-5a: optionally allocate a parallel "view"
+        // tensor that reads will go through. Same shape, same context,
+        // same backend buffer treatment as the backbone tensors.
+        ggml_tensor * vk = nullptr;
+        ggml_tensor * vv = nullptr;
+        if (tq_view_bind_ && is_tq()) {
+            if (has_k && llama_kv_tq::is_turboquant_kv_type(requested_type_k_)) {
+                vk = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+                ggml_format_name(vk, "tq_view_k_l%d", il);
+            }
+            if (has_v && llama_kv_tq::is_turboquant_kv_type(requested_type_v_)) {
+                vv = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+                ggml_format_name(vv, "tq_view_v_l%d", il);
+            }
+        }
+        tq_view_k_.push_back(vk);
+        tq_view_v_.push_back(vv);
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
@@ -374,6 +392,14 @@ llama_kv_cache::llama_kv_cache(
         // Sprint 4c step 3c-2b: opt-in write-back readthrough.
         if (const char * e = std::getenv("LLAMA_TQ_READTHROUGH")) {
             tq_readthrough_ = (std::atoi(e) != 0);
+        }
+        // Sprint 4c step 3c-5a: opt-in view-bind (separate read tensor).
+        // Implies readthrough — without it the view tensor stays at the
+        // zeros that ggml_backend_buffer_clear initialized it to and
+        // attention would read garbage.
+        if (const char * e = std::getenv("LLAMA_TQ_VIEW_BIND")) {
+            tq_view_bind_ = (std::atoi(e) != 0);
+            if (tq_view_bind_) tq_readthrough_ = true;
         }
 
         // Sprint 4c step 3c-2b proper fix: allocate the slot→TC-position
@@ -1323,12 +1349,23 @@ void llama_kv_cache::tq_apply_readthrough_() {
         };
 
         for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            // Sprint 4c step 3c-5a: when view-bind is on, write into
+            // the parallel view tensors. Otherwise (legacy readthrough)
+            // continue writing into the backbone.
+            ggml_tensor * k_target = layers[ikv].k;
+            ggml_tensor * v_target = layers[ikv].v;
+            if (tq_view_bind_) {
+                if (ikv < tq_view_k_.size() && tq_view_k_[ikv])
+                    k_target = tq_view_k_[ikv];
+                if (ikv < tq_view_v_.size() && tq_view_v_[ikv])
+                    v_target = tq_view_v_[ikv];
+            }
             writeback_layer(
-                layers[ikv].k,
+                k_target,
                 ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                 tq_slot_to_pos_k_, /*is_v_side=*/false);
             writeback_layer(
-                layers[ikv].v,
+                v_target,
                 ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
                 tq_slot_to_pos_v_, /*is_v_side=*/true);
         }
@@ -2074,6 +2111,13 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
+    // Sprint 4c step 3c-5a: when view-bind is on, attention reads from
+    // the parallel TQ view tensor instead of the backbone. Backbone
+    // remains the cpy_k write target for fresh-data observation.
+    if (tq_view_bind_ && ikv < (int) tq_view_k_.size() && tq_view_k_[ikv]) {
+        k = tq_view_k_[ikv];
+    }
+
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
@@ -2093,6 +2137,11 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+
+    // Sprint 4c step 3c-5a: same redirection as get_k.
+    if (tq_view_bind_ && ikv < (int) tq_view_v_.size() && tq_view_v_[ikv]) {
+        v = tq_view_v_[ikv];
+    }
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];

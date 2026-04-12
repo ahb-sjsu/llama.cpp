@@ -254,7 +254,8 @@ After CUDA kernels land:
     - hot_window=8 (mostly cold, real compression): tq_kv4 0.0%, tq_kv3 66.7%, tq_kv2 87.5%. This is the **real TurboQuant quality curve** on attention output for a 0.5B model
   - [x] **Step 3c-3** — `seq_rm` / `seq_cp` (different streams) / `seq_keep` invalidate the slot map; `clear` already does
   - [x] **Step 3c-4** — transpose-aware V observation/writeback. When `v_trans=true`, observe and writeback use per-element strided memory access. V validation cosines are now real (not garbage-vs-garbage). Atlas Qwen2.5-0.5B with K+V readthrough, hot=512 (all-hot, lossless): tq_kv4/3/2 all 0.0% disagreement. K + V validate cos = 1.0; cold-validate V cos = 0.9792 mean / 0.9530 min (matches K's curve)
-  - [ ] Step 3c-5 — shrink fp16 backbone (the actual VRAM savings step). Requires either: (a) backbone ring of `hot_window` slots with slot remapping in cpy_k, or (b) replace backbone reads via custom ggml op that materializes from `tiered_cache`. Both are non-trivial graph surgery and warrant their own focused sprint
+  - [x] **Step 3c-5a (spike)** — `LLAMA_TQ_VIEW_BIND=1` allocates a parallel `tq_view_k_/v_` tensor per layer (same shape, same backend buffer pool); `get_k`/`get_v` redirect through it; `cpy_k` keeps writing to backbone (so observation captures fresh ubatch data); post_compute writeback targets the view tensor. Verified 0% sampled-token disagreement vs f16 across tq_kv2/3/4 on Atlas. Reads now provably go through `tiered_cache` independent of the backbone — unblocks shrinking the backbone in 3c-5b
+  - [ ] Step 3c-5b — shrink the backbone (the actual VRAM savings). Either reduce `layers[il].k` to `hot_window` slots with ring-modulo `cpy_k` index remapping, or remove the backbone entirely and route `cpy_k` writes directly into the view tensor. Either way, KV MiB drops from full-fp16 to (small backbone) + (TQ-compressed cold tier)
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

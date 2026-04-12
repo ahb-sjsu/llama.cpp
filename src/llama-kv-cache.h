@@ -406,6 +406,20 @@ private:
     bool     tq_readthrough_ = false;
     void     tq_apply_readthrough_();
 
+    // Sprint 4c step 3c-5a: opt-in via LLAMA_TQ_VIEW_BIND=1. When set,
+    // a parallel "view" tensor is allocated per layer (same shape and
+    // backend buffer as the main K/V backbone). post_compute populates
+    // it from tiered_cache; get_k/get_v return a view of THIS tensor
+    // instead of the backbone. cpy_k still writes to the backbone (so
+    // the observe path captures fresh ubatch data unchanged). This
+    // unblocks shrinking the backbone in 3c-5b — once reads are
+    // confirmed to work from a separate tensor, the backbone can be
+    // reduced to the hot-window-only ring it really needs to be.
+    bool tq_view_bind_ = false;
+    // Parallel to layers[].k / layers[].v. nullptr when view-bind off.
+    std::vector<ggml_tensor *> tq_view_k_;
+    std::vector<ggml_tensor *> tq_view_v_;
+
     // Per-stream slot → most-recent tiered_cache position. -1 means never
     // observed (or invalidated by clear/seq_rm). Updated on each observe;
     // overwriting is intentional (slot reuse → latest mapping wins).
