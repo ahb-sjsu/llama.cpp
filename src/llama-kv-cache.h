@@ -4,7 +4,9 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-kv-tiered.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -155,6 +157,21 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // Sprint 4c step 2a: these return what the *user* requested (which may
+    // be GGML_TYPE_TQ_KV*), separate from what the underlying ggml tensor
+    // was allocated as (always a packed type). type_k()/type_v() above
+    // return the latter.
+    ggml_type requested_type_k() const { return requested_type_k_; }
+    ggml_type requested_type_v() const { return requested_type_v_; }
+
+    // True when the user asked for a TurboQuant KV type. The tiered_cache
+    // objects in tq_k_caches/tq_v_caches are populated only in this case.
+    // Writes and reads through them arrive in step 2b and 3 respectively.
+    bool is_tq() const {
+        return llama_kv_tq::is_turboquant_kv_type(requested_type_k_)
+            || llama_kv_tq::is_turboquant_kv_type(requested_type_v_);
+    }
+
     //
     // graph_build API
     //
@@ -269,6 +286,16 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // Sprint 4c step 2a: TurboQuant-side shadow storage. When the user
+    // requests a TQ KV type, the ggml tensor in `layers[il].k` stays fp16
+    // (so existing code paths keep working unchanged) and these parallel
+    // tiered_cache objects hold the TurboQuant-packed state. Empty in the
+    // non-TQ case.
+    ggml_type requested_type_k_ = GGML_TYPE_COUNT;
+    ggml_type requested_type_v_ = GGML_TYPE_COUNT;
+    std::vector<std::unique_ptr<llama_kv_tq::tiered_cache>> tq_k_caches;
+    std::vector<std::unique_ptr<llama_kv_tq::tiered_cache>> tq_v_caches;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

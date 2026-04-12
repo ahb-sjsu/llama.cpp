@@ -2954,17 +2954,19 @@ llama_context * llama_init_from_model(
     };
     if (is_tq_kv(params.type_k) || is_tq_kv(params.type_v)) {
         LLAMA_LOG_WARN(
-            "%s: --cache-type-k/v %s/%s — Sprint 4c step 1 maps these to "
-            "fp16 storage. Inference is correct but no compression "
-            "savings yet. Step 2 attaches the tiered_cache backend.\n",
+            "%s: --cache-type-k/v %s/%s — Sprint 4c step 2a: the TQ tag "
+            "propagates to llama_kv_cache where a parallel tiered_cache "
+            "is allocated, but the underlying ggml tensor still holds "
+            "fp16. Compression writes land in step 2b.\n",
             __func__,
             ggml_type_name(params.type_k),
             ggml_type_name(params.type_v));
-        // Substitute at the llama_context boundary so downstream
-        // validation (flash-attn blck_size checks, split-mode gates)
-        // sees a concrete packed type instead of blck_size=0.
-        if (is_tq_kv(params.type_k)) params.type_k = GGML_TYPE_F16;
-        if (is_tq_kv(params.type_v)) params.type_v = GGML_TYPE_F16;
+        // Note: we do NOT substitute params.type_k/v here. The TQ tag
+        // must reach llama_kv_cache so it can record requested_type_k_
+        // and allocate the per-layer tiered_cache objects. The
+        // downstream validation blocks below (SPLIT_MODE_TENSOR gate,
+        // flash-attn blck_size check) use a local copy to avoid seeing
+        // blck_size=0.
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
@@ -2981,13 +2983,19 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
         }
-        if (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v)) {
+        // TQ types are marked is_quantized=true (so this gate still fires)
+        // but their underlying fp16 storage is fine with SPLIT_MODE_TENSOR.
+        // Treat them as fp16 for this validation.
+        const bool tk_quant = ggml_is_quantized(params.type_k) && !is_tq_kv(params.type_k);
+        const bool tv_quant = ggml_is_quantized(params.type_v) && !is_tq_kv(params.type_v);
+        if (tk_quant || tv_quant) {
             LLAMA_LOG_ERROR("%s: simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented\n", __func__);
             return nullptr;
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        ggml_is_quantized(params.type_k) && !is_tq_kv(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
@@ -2998,7 +3006,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED &&
+        ggml_is_quantized(params.type_v) && !is_tq_kv(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             if (model->hparams.n_embd_head_v(il) % blck_size != 0) {

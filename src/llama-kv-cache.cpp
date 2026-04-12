@@ -110,6 +110,13 @@ llama_kv_cache::llama_kv_cache(
     // constructor directly (the llama_context boundary already substitutes
     // for the main inference path). Without this, ggml_new_tensor_3d
     // would hit blck_size=0 and divide by zero.
+    //
+    // Sprint 4c step 2a: we also record the *requested* type before
+    // substitution so the rest of the class knows whether the user
+    // asked for TQ storage. The tiered_cache shadow buffers are
+    // allocated below, after we know the per-layer head_dim.
+    requested_type_k_ = type_k;
+    requested_type_v_ = type_v;
     type_k = llama_kv_tq_underlying(type_k);
     type_v = llama_kv_tq_underlying(type_v);
 
@@ -241,6 +248,44 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        // Sprint 4c step 2a: allocate a TurboQuant shadow cache per layer
+        // when the user requested a TQ type. Each layer gets its own
+        // tiered_cache because n_head_kv / head_dim can vary across
+        // layers (GQA/MQA/MLA). The hot window is a tunable default for
+        // now; a future CLI flag (--kv-hot-window) will expose it.
+        if (is_tq()) {
+            const uint32_t hot_window =
+                std::min<uint32_t>(kv_size, 512u);
+
+            if (llama_kv_tq::is_turboquant_kv_type(requested_type_k_) && has_k) {
+                llama_kv_tq::tiered_cache_config cfg;
+                cfg.n_layers   = 1;
+                cfg.n_kv_heads = hparams.n_head_kv(il);
+                cfg.head_dim   = hparams.n_embd_head_k(il);
+                cfg.hot_window = (int) hot_window;
+                cfg.cold_bits  = static_cast<llama_kv_tq::bits>(
+                    llama_kv_tq::ggml_type_to_bits(requested_type_k_));
+                tq_k_caches.emplace_back(
+                    std::make_unique<llama_kv_tq::tiered_cache>(cfg));
+            } else {
+                tq_k_caches.emplace_back(nullptr);
+            }
+
+            if (llama_kv_tq::is_turboquant_kv_type(requested_type_v_) && has_v) {
+                llama_kv_tq::tiered_cache_config cfg;
+                cfg.n_layers   = 1;
+                cfg.n_kv_heads = hparams.n_head_kv(il);
+                cfg.head_dim   = hparams.n_embd_head_v(il);
+                cfg.hot_window = (int) hot_window;
+                cfg.cold_bits  = static_cast<llama_kv_tq::bits>(
+                    llama_kv_tq::ggml_type_to_bits(requested_type_v_));
+                tq_v_caches.emplace_back(
+                    std::make_unique<llama_kv_tq::tiered_cache>(cfg));
+            } else {
+                tq_v_caches.emplace_back(nullptr);
+            }
+        }
     }
 
     if (reuse) {
@@ -296,6 +341,19 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+    }
+
+    if (is_tq()) {
+        int n_tq_k = 0, n_tq_v = 0;
+        for (const auto & p : tq_k_caches) if (p) ++n_tq_k;
+        for (const auto & p : tq_v_caches) if (p) ++n_tq_v;
+        LLAMA_LOG_INFO(
+            "%s: TurboQuant shadow caches allocated (%s/%s): "
+            "%d K layers, %d V layers (Sprint 4c step 2a — no writes yet)\n",
+            __func__,
+            ggml_type_name(requested_type_k_),
+            ggml_type_name(requested_type_v_),
+            n_tq_k, n_tq_v);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
