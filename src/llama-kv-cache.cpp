@@ -749,6 +749,13 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    // Sprint 4c step 2b: flush any TQ observations left over from a
+    // previous decode() call. Between decodes there is no active graph
+    // compute, so the cache tensor is in a stable state.
+    if (is_tq()) {
+        tq_flush_pending_();
+    }
+
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -1089,7 +1096,84 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::tq_flush_pending_() {
+    if (tq_pending_.empty()) return;
+
+    // Count how many tokens we'll observe in this flush (just for logging).
+    size_t n_tokens_flushed = 0;
+    for (const auto & pend : tq_pending_) n_tokens_flushed += pend.idxs.size();
+
+    // Temp fp32 buffer reused across tokens. Sized for the largest layer.
+    std::vector<float> k_buf, v_buf;
+
+    for (const auto & pend : tq_pending_) {
+        const size_t n = pend.idxs.size();
+        for (size_t t = 0; t < n; ++t) {
+            const uint32_t idx  = pend.idxs[t];
+            const uint32_t strm = pend.strm[t];
+
+            for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+                auto & L = layers[ikv];
+
+                auto observe_one = [&](ggml_tensor * cache,
+                                       llama_kv_tq::tiered_cache * tq,
+                                       std::vector<float> & buf) {
+                    if (!cache || !tq) return;
+                    const size_t n_elem    = cache->ne[0];
+                    const size_t row_bytes = cache->nb[1];
+                    const size_t strm_bytes = cache->nb[2];
+                    const size_t offset = (size_t) strm * strm_bytes
+                                        + (size_t) idx  * row_bytes;
+                    std::vector<uint16_t> fp16_buf(n_elem);
+                    ggml_backend_tensor_get(
+                        cache, fp16_buf.data(), offset,
+                        n_elem * sizeof(uint16_t));
+                    buf.resize(n_elem);
+                    ggml_fp16_to_fp32_row(
+                        (const ggml_fp16_t *) fp16_buf.data(),
+                        buf.data(), n_elem);
+                    // tiered_cache takes K and V as separate pointers;
+                    // at this step we pass the same buffer for both
+                    // (V is handled by its own call below so this is
+                    // benign — the second arg is unused for this cache's
+                    // purpose since we only care about the K or V side).
+                    tq->add_token(buf.data(), buf.data());
+                };
+
+                observe_one(L.k,
+                            ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
+                            k_buf);
+                observe_one(L.v,
+                            ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                            v_buf);
+            }
+        }
+    }
+
+    tq_pending_.clear();
+
+    // Report running totals once per flush. Use first layer as a witness
+    // (all TQ-enabled layers accumulate in lockstep).
+    int tot_k = 0, tot_v = 0;
+    if (!tq_k_caches.empty() && tq_k_caches.front()) {
+        tot_k = tq_k_caches.front()->n_tokens();
+    }
+    if (!tq_v_caches.empty() && tq_v_caches.front()) {
+        tot_v = tq_v_caches.front()->n_tokens();
+    }
+    LLAMA_LOG_DEBUG(
+        "%s: flushed %zu tokens into TQ observation; totals now K=%d V=%d\n",
+        __func__, n_tokens_flushed, tot_k, tot_v);
+}
+
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    // Sprint 4c step 2b: flush the previous ubatch's observations
+    // before admitting this one. By now, the forward pass that
+    // populated those slots has completed.
+    if (is_tq()) {
+        tq_flush_pending_();
+    }
+
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1159,6 +1243,20 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // Sprint 4c step 2b: queue this ubatch's slot indices for observation
+    // at the start of the NEXT apply_ubatch (by which time the forward
+    // pass has completed and the data has landed in the fp16 cache).
+    if (is_tq()) {
+        pending_tq_obs p;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t i = 0; i < sinfo.idxs[s].size(); ++i) {
+                p.idxs.push_back(sinfo.idxs[s][i]);
+                p.strm.push_back(sinfo.strm[s]);
+            }
+        }
+        tq_pending_.push_back(std::move(p));
     }
 }
 

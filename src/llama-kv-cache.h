@@ -297,6 +297,25 @@ private:
     std::vector<std::unique_ptr<llama_kv_tq::tiered_cache>> tq_k_caches;
     std::vector<std::unique_ptr<llama_kv_tq::tiered_cache>> tq_v_caches;
 
+    // Sprint 4c step 2b: deferred-observation queue. apply_ubatch runs
+    // BEFORE the forward pass, so it can't read the freshly-written K/V
+    // values yet. We queue the ubatch here, then at the *start* of the
+    // next apply_ubatch (by which time the previous forward pass has
+    // completed and the data has landed in layers[il].k/v) we flush:
+    // read the fp16 values via ggml_backend_tensor_get and push them
+    // into tq_k_caches/tq_v_caches via add_token.
+    //
+    // Known limitation: the very last ubatch of a decode() call isn't
+    // flushed until the *next* decode() call. Step 2c will add explicit
+    // flush points (end-of-decode, before state_write, etc.).
+    struct pending_tq_obs {
+        std::vector<uint32_t> idxs;   // slot indices that were written, flat
+        std::vector<uint32_t> strm;   // parallel stream index for each idx
+    };
+    std::vector<pending_tq_obs> tq_pending_;
+
+    void tq_flush_pending_();   // defined in llama-kv-cache.cpp
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
