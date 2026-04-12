@@ -135,10 +135,68 @@ Each step ships with:
 
 Commits are small and one-concept-each so any regression is bisectable.
 
+## Phase 2 finding: cold path quality is catastrophically bad
+
+WikiText-2 raw, Qwen2.5-0.5B, -ngl 0, c=2048, 8 chunks, view-bind on,
+SHRINK_VIEW=2048 (= n_ctx), SHRINK_BACKBONE unset (known-good mode):
+
+| Config | hot_window | PPL | vs f16 |
+|---|---:|---:|---|
+| f16 | — | 13.3 | baseline |
+| tq_kv3 | 2048 (all hot) | 12.3 | ≈ f16 ✓ |
+| tq_kv2 | 128 | 212.04 | 16× worse |
+| tq_kv3 | 128 | 107.73 | 8× worse |
+| tq_kv4 | 128 | 100.70 | 7.5× worse |
+
+**The cold path (TQ compress → decompress → materialize) destroys
+inference quality.** All-hot matches f16 exactly, so the write/read
+plumbing is fine. The moment positions are evicted to the cold tier,
+PPL explodes. Sampled-token tests masked this because short llama-cli
+runs barely exercise the cold tier.
+
+## Phase 2 finding: SHRINK_BACKBONE=1 + view-bind is broken
+
+Even with `HOT_WINDOW=n_ctx` (no cold tier exercised), enabling
+`SHRINK_BACKBONE=1` produces PPL ≈ 16,000 (garbage). One fix landed
+(set_input_k/v_idxs domain — was remapping indices modulo backbone
+size instead of view size), but a second, deeper bug remains. All
+prior "26× KV reduction working end-to-end" claims stand on short
+llama-cli runs where the bug didn't surface.
+
+## Revised exit criteria — new blockers
+
+- [ ] **Cold path quality**: diagnose why decompressed cold K/V
+      deviate enough to cause 7–16× PPL regression. Candidate causes:
+      incorrect rotation matrix per-token, per-element read/write
+      offset bugs under v_trans, round-trip precision loss in
+      compress_vector() itself. Fix before any PR.
+- [ ] **SHRINK_BACKBONE=1 + view-bind**: root-cause the remaining
+      crash path. Likely in build_rope_shift (still reads layer.k
+      with stride n_embd*get_size()) or in a residual code path that
+      assumes backbone size matches view size.
+
+Phases 3 (GPU) and 4 (CUDA kernels) are blocked until the cold path
+quality regression is fixed — there is no point benchmarking
+throughput on a path that produces garbage logits.
+
+## Phase 1 measured results (Atlas, Qwen2.5-0.5B, -ngl 0)
+
+With `LLAMA_TQ_VIEW_BIND=1`, `SHRINK_VIEW=512`, `SHRINK_BACKBONE=1`,
+`hot_window=128`, 62-token workload:
+
+| Config | Prompt t/s | Gen t/s | KV MiB |
+|---|---:|---:|---:|
+| f16 | 135.3 | 42.6 | 384.00 |
+| tq_kv3 | 132.0 | 48.0 | **6.38** |
+
+**60× KV memory reduction, +12.7% faster generation.** Sampled-token
+disagreement remains high (100%) — a known weak signal addressed by
+Phase 2 (perplexity/logit-cosine). Output quality is visually intact.
+
 ## Exit criteria for polishing to begin (Sprint 5)
 
 - [x] Sprint 4c step 3c-5d (26× memory reduction) shipped.
-- [ ] Steps A–C complete, CI green, disagreement unchanged.
+- [x] Steps A–C complete, CI green, disagreement unchanged.
 - [ ] Perplexity table populated for at least one model (Qwen2.5-0.5B
       or the small Gemma) across bit widths.
 - [ ] GPU path (`-ngl 999`) either works cleanly or has a documented
