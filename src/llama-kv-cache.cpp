@@ -1268,39 +1268,69 @@ void llama_kv_cache::tq_apply_readthrough_() {
         diag_init = true;
     }
 
-    // Default mode (no diag override): production K writeback via the
-    // slot→TC-position map. V is skipped pending transpose-aware support.
-    // Mirrors the body of diag_mode == 5.
+    // Default mode (no diag override): production K + V writeback via
+    // the slot→TC-position map. V is transpose-aware: when v_trans=true
+    // we scatter the materialized fp16 data into per-element strided
+    // offsets in the cache, just like the observe-time read pattern.
     if (diag_mode == 0) {
         std::vector<float> rb;
         std::vector<uint16_t> fp16;
-        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
-            auto * cache = layers[ikv].k;
-            if (!cache || ikv >= tq_k_caches.size() || !tq_k_caches[ikv])
-                continue;
-            auto * tq = tq_k_caches[ikv].get();
-            const size_t n_elem = cache->ne[0];
-            const size_t row_bytes = cache->nb[1];
+
+        auto writeback_layer =
+            [&](ggml_tensor * cache,
+                llama_kv_tq::tiered_cache * tq,
+                const std::vector<std::vector<int32_t>> & slot_maps,
+                bool is_v_side)
+        {
+            if (!cache || !tq) return;
+            const size_t n_elem     = cache->ne[0];
+            const size_t row_bytes  = cache->nb[1];
             const size_t strm_bytes = cache->nb[2];
-            for (uint32_t strm = 0; strm < tq_slot_to_pos_k_.size(); ++strm) {
-                const auto & slot_map = tq_slot_to_pos_k_[strm];
+            const size_t kv_size_   = cache->ne[1];
+            const size_t fp16_sz    = sizeof(uint16_t);
+            const bool   trans      = is_v_side && v_trans;
+
+            for (uint32_t strm = 0; strm < slot_maps.size(); ++strm) {
+                const auto & slot_map = slot_maps[strm];
                 for (uint32_t slot = 0; slot < slot_map.size(); ++slot) {
                     const int32_t tc_pos = slot_map[slot];
                     if (tc_pos < 0) continue;
                     if (tc_pos >= tq->n_tokens()) continue;
-                    tq->read_token_k(tc_pos, rb);
+                    if (is_v_side) tq->read_token_v(tc_pos, rb);
+                    else           tq->read_token_k(tc_pos, rb);
                     fp16.resize(rb.size());
                     ggml_fp32_to_fp16_row(
                         rb.data(),
                         reinterpret_cast<ggml_fp16_t *>(fp16.data()),
                         rb.size());
-                    const size_t offset = (size_t) strm * strm_bytes
-                                        + (size_t) slot * row_bytes;
-                    ggml_backend_tensor_set(
-                        cache, fp16.data(), offset,
-                        n_elem * sizeof(uint16_t));
+                    if (trans) {
+                        const size_t base = (size_t) strm * strm_bytes
+                                          + (size_t) slot * fp16_sz;
+                        for (size_t e = 0; e < n_elem; ++e) {
+                            const size_t off = base + e * kv_size_ * fp16_sz;
+                            ggml_backend_tensor_set(
+                                cache, &fp16[e], off, fp16_sz);
+                        }
+                    } else {
+                        const size_t offset = (size_t) strm * strm_bytes
+                                            + (size_t) slot * row_bytes;
+                        ggml_backend_tensor_set(
+                            cache, fp16.data(), offset,
+                            n_elem * fp16_sz);
+                    }
                 }
             }
+        };
+
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            writeback_layer(
+                layers[ikv].k,
+                ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
+                tq_slot_to_pos_k_, /*is_v_side=*/false);
+            writeback_layer(
+                layers[ikv].v,
+                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                tq_slot_to_pos_v_, /*is_v_side=*/true);
         }
         return;
     }
@@ -1533,15 +1563,35 @@ void llama_kv_cache::tq_flush_pending_() {
                                        std::vector<float> & buf,
                                        bool is_v_side) {
                     if (!cache || !tq) return;
-                    const size_t n_elem    = cache->ne[0];
-                    const size_t row_bytes = cache->nb[1];
+                    const size_t n_elem     = cache->ne[0];
+                    const size_t row_bytes  = cache->nb[1];
                     const size_t strm_bytes = cache->nb[2];
-                    const size_t offset = (size_t) strm * strm_bytes
-                                        + (size_t) idx  * row_bytes;
+                    const size_t kv_size_   = cache->ne[1];
+                    const size_t fp16_sz    = sizeof(uint16_t);
                     std::vector<uint16_t> fp16_buf(n_elem);
-                    ggml_backend_tensor_get(
-                        cache, fp16_buf.data(), offset,
-                        n_elem * sizeof(uint16_t));
+                    if (is_v_side && v_trans) {
+                        // Sprint 4c step 3c-4: V is stored transposed —
+                        // shape [n_embd_v_gqa, kv_size] interpreted as
+                        // (one element per row, all kv positions across
+                        // a row). Token `idx`'s V values are scattered
+                        // at strided offsets [(e * kv_size + idx) * 2]
+                        // for e in [0, n_embd_v_gqa). Read per-element.
+                        const size_t base = (size_t) strm * strm_bytes
+                                          + (size_t) idx  * fp16_sz;
+                        for (size_t e = 0; e < n_elem; ++e) {
+                            const size_t off = base + e * kv_size_ * fp16_sz;
+                            ggml_backend_tensor_get(
+                                cache, &fp16_buf[e], off, fp16_sz);
+                        }
+                    } else {
+                        // Contiguous row read (K always; V when
+                        // v_trans=false, e.g. with --flash-attn).
+                        const size_t offset = (size_t) strm * strm_bytes
+                                            + (size_t) idx  * row_bytes;
+                        ggml_backend_tensor_get(
+                            cache, fp16_buf.data(), offset,
+                            n_elem * fp16_sz);
+                    }
                     buf.resize(n_elem);
                     ggml_fp16_to_fp32_row(
                         (const ggml_fp16_t *) fp16_buf.data(),
@@ -1680,19 +1730,12 @@ void llama_kv_cache::tq_flush_pending_() {
                 observe_one(L.k,
                             ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                             k_buf, /*is_v_side=*/false);
-                // Sprint 4c step 3c-3: skip V observe when v_trans=true.
-                // V is stored transposed ([head_dim, kv_size] instead of
-                // [kv_size, head_dim]) so a per-row contiguous read does
-                // NOT capture one token's V values — it captures one
-                // element across many positions. Honest to-not-store
-                // garbage in tq_v_caches than to silently corrupt it.
-                // Use --flash-attn to set v_trans=false and unlock the V
-                // path; the transpose-aware V observe is Sprint 4c-4.
-                if (!v_trans) {
-                    observe_one(L.v,
-                                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
-                                v_buf, /*is_v_side=*/true);
-                }
+                // Sprint 4c step 3c-4: V is now observed correctly even
+                // when v_trans=true (per-element strided read inside
+                // observe_one). Slow but correct.
+                observe_one(L.v,
+                            ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                            v_buf, /*is_v_side=*/true);
             }
         }
     }
@@ -1716,15 +1759,27 @@ void llama_kv_cache::tq_flush_pending_() {
             const size_t n_elem = cache->ne[0];
             const size_t row_bytes = cache->nb[1];
             const size_t strm_bytes = cache->nb[2];
+            const size_t kv_size_  = cache->ne[1];
+            const size_t fp16_sz   = sizeof(uint16_t);
             for (const auto & cc : list) {
                 if (cc.tq_pos >= n_cold) continue;  // still hot, skip
-                // Read fp16 backbone row.
+                // Read fp16 backbone row (transpose-aware for v_trans V).
                 std::vector<uint16_t> backbone_fp16(n_elem);
-                const size_t offset = (size_t) cc.strm * strm_bytes
-                                    + (size_t) cc.idx  * row_bytes;
-                ggml_backend_tensor_get(
-                    cache, backbone_fp16.data(), offset,
-                    n_elem * sizeof(uint16_t));
+                if (is_v_side && v_trans) {
+                    const size_t base = (size_t) cc.strm * strm_bytes
+                                      + (size_t) cc.idx  * fp16_sz;
+                    for (size_t e = 0; e < n_elem; ++e) {
+                        const size_t off = base + e * kv_size_ * fp16_sz;
+                        ggml_backend_tensor_get(
+                            cache, &backbone_fp16[e], off, fp16_sz);
+                    }
+                } else {
+                    const size_t offset = (size_t) cc.strm * strm_bytes
+                                        + (size_t) cc.idx  * row_bytes;
+                    ggml_backend_tensor_get(
+                        cache, backbone_fp16.data(), offset,
+                        n_elem * fp16_sz);
+                }
                 // Materialize cold.
                 std::vector<uint16_t> mat_fp16;
                 tq->materialize_fp16_rows(
@@ -1762,13 +1817,12 @@ void llama_kv_cache::tq_flush_pending_() {
             cold_check_one(layers[ikv].k,
                 ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                 cold_check_k[ikv], /*is_v_side=*/false);
-            // Same v_trans skip as above — comparing transposed V with
-            // contiguous-read assumption produces meaningless cosines.
-            if (!v_trans) {
-                cold_check_one(layers[ikv].v,
-                    ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
-                    cold_check_v[ikv], /*is_v_side=*/true);
-            }
+            // Sprint 4c step 3c-4: cold_check_one is now transpose-aware
+            // (per-element reads when is_v_side && v_trans), so V can be
+            // validated regardless of v_trans.
+            cold_check_one(layers[ikv].v,
+                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                cold_check_v[ikv], /*is_v_side=*/true);
         }
     }
 
