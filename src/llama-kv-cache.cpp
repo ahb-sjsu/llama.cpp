@@ -252,11 +252,19 @@ llama_kv_cache::llama_kv_cache(
         // Sprint 4c step 2a: allocate a TurboQuant shadow cache per layer
         // when the user requested a TQ type. Each layer gets its own
         // tiered_cache because n_head_kv / head_dim can vary across
-        // layers (GQA/MQA/MLA). The hot window is a tunable default for
-        // now; a future CLI flag (--kv-hot-window) will expose it.
+        // layers (GQA/MQA/MLA). The hot window defaults to min(kv_size, 512)
+        // but the env var LLAMA_TQ_HOT_WINDOW overrides it; tests and
+        // quick experiments use this to force cold-tier eviction on
+        // short contexts. A proper CLI flag lands with the read-side
+        // wiring (follow-up sprint).
         if (is_tq()) {
-            const uint32_t hot_window =
-                std::min<uint32_t>(kv_size, 512u);
+            uint32_t hot_window = std::min<uint32_t>(kv_size, 512u);
+            if (const char * e = std::getenv("LLAMA_TQ_HOT_WINDOW")) {
+                const long v = std::atol(e);
+                if (v >= 0) {
+                    hot_window = std::min<uint32_t>(kv_size, (uint32_t) v);
+                }
+            }
 
             if (llama_kv_tq::is_turboquant_kv_type(requested_type_k_) && has_k) {
                 llama_kv_tq::tiered_cache_config cfg;
@@ -345,15 +353,19 @@ llama_kv_cache::llama_kv_cache(
 
     if (is_tq()) {
         int n_tq_k = 0, n_tq_v = 0;
-        for (const auto & p : tq_k_caches) if (p) ++n_tq_k;
+        int hot_window = 0;
+        for (const auto & p : tq_k_caches) {
+            if (p) { ++n_tq_k; hot_window = p->config().hot_window; }
+        }
         for (const auto & p : tq_v_caches) if (p) ++n_tq_v;
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
-            "%d K layers, %d V layers (Sprint 4c step 2a — no writes yet)\n",
+            "%d K layers, %d V layers, hot_window=%d "
+            "(override with env LLAMA_TQ_HOT_WINDOW)\n",
             __func__,
             ggml_type_name(requested_type_k_),
             ggml_type_name(requested_type_v_),
-            n_tq_k, n_tq_v);
+            n_tq_k, n_tq_v, hot_window);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -1152,18 +1164,25 @@ void llama_kv_cache::tq_flush_pending_() {
 
     tq_pending_.clear();
 
-    // Report running totals once per flush. Use first layer as a witness
-    // (all TQ-enabled layers accumulate in lockstep).
+    // Report running totals and memory stats once per flush. We witness
+    // against the first K and first V layer — all TQ-enabled layers
+    // accumulate in lockstep, so these numbers are representative.
+    llama_kv_tq::memory_stats ks{}, vs{};
     int tot_k = 0, tot_v = 0;
     if (!tq_k_caches.empty() && tq_k_caches.front()) {
         tot_k = tq_k_caches.front()->n_tokens();
+        ks    = tq_k_caches.front()->stats();
     }
     if (!tq_v_caches.empty() && tq_v_caches.front()) {
         tot_v = tq_v_caches.front()->n_tokens();
+        vs    = tq_v_caches.front()->stats();
     }
     LLAMA_LOG_DEBUG(
-        "%s: flushed %zu tokens into TQ observation; totals now K=%d V=%d\n",
-        __func__, n_tokens_flushed, tot_k, tot_v);
+        "%s: flushed %zu tokens -> K=%d (hot=%d cold=%d ratio=%.2fx) "
+        "V=%d (hot=%d cold=%d ratio=%.2fx)\n",
+        __func__, n_tokens_flushed,
+        tot_k, ks.hot_tokens, ks.cold_tokens, ks.compression_ratio,
+        tot_v, vs.hot_tokens, vs.cold_tokens, vs.compression_ratio);
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {

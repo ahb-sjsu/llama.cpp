@@ -94,6 +94,33 @@ test_round_trip D=256 bits=3
 
 The CI workflow `.github/workflows/turboquant-kv.yml` runs the same on push/PR.
 
+## Using TQ KV from the CLI (Sprint 4c in progress)
+
+```bash
+./llama-cli -m <model.gguf> \
+    --cache-type-k tq_kv3 --cache-type-v tq_kv3 \
+    -p "hello" -n 10 -v
+```
+
+Today (Sprint 4c steps 1-3a): the CLI flag parses, the `llama_kv_cache`
+allocates per-layer `tiered_cache` shadow buffers, writes are observed
+(fp16 cache rows → `tiered_cache::add_token`), and eviction kicks in
+once `hot_window` tokens are accumulated. The attention compute still
+reads from the fp16 tensor — actual VRAM savings land in Step 3b.
+
+To force cold-tier eviction on short contexts (useful for testing):
+
+```bash
+LLAMA_TQ_HOT_WINDOW=4 ./llama-cli --cache-type-k tq_kv3 ... -v
+```
+
+With `-v`, look for lines like:
+```
+llama_kv_cache: TurboQuant shadow caches allocated (tq_kv3/tq_kv3):
+    24 K layers, 24 V layers, hot_window=4
+tq_flush_pending_: flushed 30 tokens -> K=34 (hot=4 cold=30 ratio=3.11x) ...
+```
+
 ## Tiered cache (Sprint 4)
 
 [`src/llama-kv-tiered.h`](../src/llama-kv-tiered.h) provides
@@ -173,7 +200,8 @@ After CUDA kernels land:
   - [x] **Step 1** — TQ types map to fp16 internally (no crash, no compression yet)
   - [x] **Step 2a** — per-layer `tiered_cache` allocation
   - [x] **Step 2b** — queue + flush observe in `apply_ubatch`/`prepare` (writes now populate tiered_cache)
-  - [ ] Step 3 — activate eviction + materialize_view + actual compression (read side)
+  - [x] **Step 3a** — env var `LLAMA_TQ_HOT_WINDOW` + per-flush stats (cold tier is populated on real inference data)
+  - [ ] Step 3b — materialize_view + shrink fp16 storage (actual VRAM savings)
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split
