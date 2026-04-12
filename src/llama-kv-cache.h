@@ -156,6 +156,10 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // Sprint 4c step 3c-5d: expose for llama_kv_cache_context
+    // so the sched_reserve path can cap its worst-case n_kv.
+    uint32_t get_tq_shrink_view_size() const { return tq_shrink_view_size_; }
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -426,6 +430,10 @@ private:
     // into the ring via modulo N. Reads for attention go through the
     // view tensor (view-bind required). 0 = disabled.
     uint32_t tq_shrink_backbone_size_ = 0;
+    // Sprint 4c step 3c-5d: when set, caps both the view tensor size
+    // and the compute-reserve worst-case n_kv so the sched buffer
+    // scales with the effective context rather than logical kv_size.
+    uint32_t tq_shrink_view_size_     = 0;
     // True when the backbone tensor's ne[1] != kv_size (derived from
     // above at ctor time; mirrored here so downstream code can branch
     // cheaply without re-reading the env var).

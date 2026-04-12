@@ -132,6 +132,33 @@ llama_kv_cache::llama_kv_cache(
             tq_view_bind_ = (std::atoi(e) != 0);
             if (tq_view_bind_) tq_readthrough_ = true;
         }
+        // Sprint 4c step 3c-5d: read SHRINK_VIEW early too so
+        // view tensor allocation and get_n_kv clamp can both see it.
+        if (const char * e = std::getenv("LLAMA_TQ_SHRINK_VIEW")) {
+            long v = std::atol(e);
+            if (v > 0 && (uint32_t) v < kv_size) {
+                tq_shrink_view_size_ = (uint32_t) v;
+            }
+        }
+        // Sprint 4c step 3c-5d: SHRINK_BACKBONE must also be read
+        // before the layer loop because it drives backbone tensor size.
+        if (const char * e = std::getenv("LLAMA_TQ_SHRINK_BACKBONE")) {
+            long v = std::atol(e);
+            if (v > 0) {
+                if (v < 32) v = 32;
+                if ((uint32_t) v < kv_size) {
+                    tq_shrink_backbone_size_ = (uint32_t) v;
+                    tq_shrunk_ = true;
+                    if (!tq_view_bind_) {
+                        // SHRINK_BACKBONE without view-bind doesn't
+                        // make sense (attention would read an
+                        // undersized backbone). Enable view-bind.
+                        tq_view_bind_ = true;
+                        tq_readthrough_ = true;
+                    }
+                }
+            }
+        }
     }
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -263,13 +290,15 @@ llama_kv_cache::llama_kv_cache(
         // same backend buffer treatment as the backbone tensors.
         ggml_tensor * vk = nullptr;
         ggml_tensor * vv = nullptr;
+        // Sprint 4c step 3c-5d: view tensor uses shrunk size when set.
+        const uint32_t view_slots = tq_shrink_view_size_ > 0 ? tq_shrink_view_size_ : kv_size;
         if (tq_view_bind_ && is_tq()) {
             if (has_k && llama_kv_tq::is_turboquant_kv_type(requested_type_k_)) {
-                vk = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+                vk = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, view_slots, n_stream);
                 ggml_format_name(vk, "tq_view_k_l%d", il);
             }
             if (has_v && llama_kv_tq::is_turboquant_kv_type(requested_type_v_)) {
-                vv = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+                vv = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, view_slots, n_stream);
                 ggml_format_name(vv, "tq_view_v_l%d", il);
             }
         }
@@ -2160,6 +2189,17 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
+    // Sprint 4c step 3c-5d: if the user capped the view tensor at a
+    // smaller size, cap the graph-compute worst-case n_kv to match.
+    // This shrinks the sched_reserve buffer proportionally (that
+    // buffer scales with the worst-case n_kv used during graph build).
+    // Contract: user must keep total context <= view_size when they
+    // opt into this; exceeding it would truncate attention reads
+    // (handled in get_k via a silent clamp).
+    if (tq_view_bind_ && tq_shrink_view_size_ > 0) {
+        result = std::min(result, tq_shrink_view_size_);
+    }
+
     return result;
 }
 
@@ -3450,6 +3490,18 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+
+    // Sprint 4c step 3c-5d: init_full's worst-case n_kv drives the
+    // sched_reserve buffer size. If the user capped the TQ view,
+    // cap n_kv to match — sched_reserve then sizes the compute
+    // buffer to the effective context instead of the full kv_size.
+    if (kv->get_tq_shrink_view_size() > 0) {
+        const uint32_t before = n_kv;
+        n_kv = std::min<uint32_t>(n_kv, kv->get_tq_shrink_view_size());
+        LLAMA_LOG_WARN(
+            "%s: DIAG init_full n_kv clamped %u -> %u\n",
+            __func__, before, n_kv);
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 

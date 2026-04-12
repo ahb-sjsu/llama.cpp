@@ -257,7 +257,15 @@ After CUDA kernels land:
   - [x] **Step 3c-5a (spike)** — `LLAMA_TQ_VIEW_BIND=1` allocates a parallel `tq_view_k_/v_` tensor per layer (same shape, same backend buffer pool); `get_k`/`get_v` redirect through it; `cpy_k` keeps writing to backbone (so observation captures fresh ubatch data); post_compute writeback targets the view tensor. Verified 0% sampled-token disagreement vs f16 across tq_kv2/3/4 on Atlas
   - [x] **Step 3c-5b** — `LLAMA_TQ_SHRINK_BACKBONE=N` shrinks the fp16 backbone to `N` slots (instead of `kv_size`). `set_input_k_idxs`/`v_idxs` use ring-modulo `abs % N` to remap writes. Observe path reads at the ring-modulo position. Auto-enables view-bind (otherwise attention would read an undersized backbone). Verified on Atlas with `N=64` (backbone shrinks from 192 MiB → 192 KiB per K cache): tq_kv4/3/2 all 0% disagreement. Total KV memory still ~384 MiB because the view tensor stays full-size — **3c-5c is next: shrink the view tensor too for actual net savings**
   - [x] **Step 3c-5c** — real view-bind. Root cause found via `LLAMA_TQ_DIAG_GETK=1` per-layer tensor-pointer tracing: `cpy_k` was writing to `cache_k_l0` (`0x...fa20`) while `get_k` was returning `tq_view_k_l0` (`0x...fd00`) — two different tensors, graph chain broken. Fix: `cpy_k`/`cpy_v` redirect to the view tensor when view-bind is active; observation path also reads from the view (since cpy_k no longer writes the backbone). Verified on Atlas: 0% sampled-token disagreement across tq_kv4/3/2 with hot_window=512. Also wired `LLAMA_TQ_SHRINK_VIEW=N` for the view tensor and kept the earlier `LLAMA_TQ_SHRINK_BACKBONE=N` ring-modulo for the (now-mostly-unused) backbone. Cache tensors themselves shrink as expected; the remaining 768 MiB buffer report comes from the ggml graph-compute reserve (scaled to logical `kv_size`), which is a separate follow-up
-  - [ ] Step 3c-5d — reduce the graph-compute reserve buffer alongside the cache shrink so total process memory actually tracks the cache shrink (currently the compute scratch dominates for long contexts)
+  - [x] **Step 3c-5d** — real VRAM savings end-to-end. `get_n_kv` and `llama_kv_cache_context`'s `n_kv` are clamped to `tq_shrink_view_size_` so the sched_reserve worst-case graph is sized to the effective context, not the logical `kv_size`. Combined with `-b N -ub N` (small ubatch) the compute buffer tracks the shrinks too. Verified on Atlas (Qwen2.5-0.5B, "Hello"):
+
+    | Config | KV MiB | Compute MiB | **Total** |
+    |---|---:|---:|---:|
+    | f16 baseline (default ubatch) | 384.00 | 300.25 | **684.25** |
+    | tq_kv3 shrink-all (default ub) | 6.75 | 300.25 | **307.00** (−55%) |
+    | tq_kv3 shrink-all (ub=32) | 6.75 | 18.77 | **25.52 (−96%)** |
+
+    Generated tokens identical to fp16 baseline in all three configs.
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split
