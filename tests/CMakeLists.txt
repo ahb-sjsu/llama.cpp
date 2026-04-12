@@ -165,6 +165,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         llama_build(test-quantize-stats.cpp)
     endif()
 
+    # TurboQuant KV cache compression tests (Sprint 2)
+    # Standalone — only needs llama-kv-turboquant.cpp + STL.
+    add_executable(test-tq-kv
+        test-tq-kv.cpp
+        ${PROJECT_SOURCE_DIR}/src/llama-kv-turboquant.cpp
+    )
+    target_include_directories(test-tq-kv PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/include
+    )
+    target_link_libraries(test-tq-kv PRIVATE ggml)
+    add_test(NAME test-tq-kv COMMAND test-tq-kv)
+    set_tests_properties(test-tq-kv PROPERTIES LABELS "main")
+
     llama_build(test-gbnf-validator.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
