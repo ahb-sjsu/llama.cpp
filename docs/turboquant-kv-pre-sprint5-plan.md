@@ -135,7 +135,56 @@ Each step ships with:
 
 Commits are small and one-concept-each so any regression is bisectable.
 
-## Phase 2 finding: cold path quality is catastrophically bad
+## Phase 2 root cause: cold path bad quality is actual compression cost
+
+With `LLAMA_TQ_READTHROUGH=0` (view holds the untouched fp16 cpy_k
+writes at every slot, attention reads directly from it, TC is pure
+shadow storage), PPL matches f16 **exactly** (15.7316 on 4 chunks).
+
+With `LLAMA_TQ_READTHROUGH=1` (TC-decompressed fp16 overwrites the
+view at cold slots, so attention reads TC-decompressed data), PPL
+climbs to ~108. Per-row cold-validate cosine = 0.979 ± 0.02.
+
+**This is the actual cost of 3-bit KV compression**, not a bug. Per-
+row cosine 0.98 is what the bit budget buys; that 2% noise accumulated
+across 24 layers and 95% of tokens produces the 8× PPL regression.
+
+Prior "0% sampled-token disagreement" claims came from either
+(a) running with readthrough=0 — which produces f16-identical output
+but delivers zero compression benefit (view is fp16-sized), or
+(b) short llama-cli contexts where the cold path barely fires.
+
+## Strategic implication
+
+The memory-vs-quality knob in the current architecture is a clean
+trade, but a lot worse than any prior PR-quality claim suggested:
+
+| Config | Memory win | PPL cost |
+|---|---|---|
+| `read=0, full view` | none (view = fp16 cache) | 0 |
+| `read=1, full view` | none (still fp16-sized) | 8× |
+| `read=1, shrunk view` | up to 60× | 8×+ (cold data from TC, worse if view < hot_window) |
+| (hypothetical) `read=0, shrunk view` | up to 60× | N/A — uncovered slots have **no data source**, attention breaks |
+
+Compressed KV only pays off when readthrough is on. Readthrough only
+produces acceptable PPL if TC's per-row cosine is much better than
+0.98. The paper claims near-lossless at 3-bit for large models; our
+implementation on Qwen2.5-0.5B delivers 0.98. Candidate causes for
+the gap:
+
+1. Rotation matrix quality — is it a true Hadamard/random-orthogonal,
+   or something degenerate at small hidden sizes?
+2. Lloyd-Max boundaries — are we using the precomputed paper
+   boundaries, or inferring them per-row?
+3. Small-model sensitivity — 0.5B may be intrinsically more fragile
+   to per-K/V row noise than the 7B+ models the paper targets.
+
+Items below are now prerequisites for anything PR-worthy. Phases 3
+(GPU) and 4 (CUDA kernels) stay blocked until TC per-row cosine
+climbs substantially (target: &gt; 0.998 at 3-bit on a representative
+model).
+
+## Phase 2 finding (deprecated): cold path quality is catastrophically bad
 
 WikiText-2 raw, Qwen2.5-0.5B, -ngl 0, c=2048, 8 chunks, view-bind on,
 SHRINK_VIEW=2048 (= n_ctx), SHRINK_BACKBONE unset (known-good mode):
