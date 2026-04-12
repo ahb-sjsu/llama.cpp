@@ -9,7 +9,9 @@ on:
     branches: [feature/turboquant-kv-cache]
     paths:
       - 'src/llama-kv-turboquant*'
+      - 'src/llama-kv-tiered*'
       - 'tests/test-tq-kv.cpp'
+      - 'tests/test-tq-tiered.cpp'
       - 'tests/CMakeLists.txt'
       - 'docs/turboquant-kv-design.md'
       - 'docs/turboquant-kv-README.md'
@@ -17,7 +19,9 @@ on:
   pull_request:
     paths:
       - 'src/llama-kv-turboquant*'
+      - 'src/llama-kv-tiered*'
       - 'tests/test-tq-kv.cpp'
+      - 'tests/test-tq-tiered.cpp'
 
 jobs:
   build-and-test:
@@ -42,15 +46,21 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_CURL=OFF
 
-      - name: Build test-tq-kv
+      - name: Build test-tq-kv + test-tq-tiered
         run: |
           cd build
-          cmake --build . --target test-tq-kv -j 2
+          cmake --build . --target test-tq-kv     -j 2
+          cmake --build . --target test-tq-tiered -j 2
 
       - name: Run test-tq-kv
         run: |
           cd build
           ./bin/test-tq-kv
+
+      - name: Run test-tq-tiered
+        run: |
+          cd build
+          ./bin/test-tq-tiered
 
   cuda-build:
     name: CUDA build (Sprint 3, build-only — no GPU runner)
@@ -105,7 +115,10 @@ jobs:
           for f in src/llama-kv-turboquant.h \
                    src/llama-kv-turboquant.cpp \
                    src/llama-kv-turboquant-cuda.cu \
-                   tests/test-tq-kv.cpp; do
+                   src/llama-kv-tiered.h \
+                   src/llama-kv-tiered.cpp \
+                   tests/test-tq-kv.cpp \
+                   tests/test-tq-tiered.cpp; do
             if grep -P '\t' "$f"; then
               echo "Tabs found in $f — use spaces"
               exit 1

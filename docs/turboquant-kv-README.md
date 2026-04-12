@@ -1,6 +1,6 @@
 # TurboQuant KV Cache Compression
 
-> **Status:** Sprint 3 of 5 (CUDA kernels in progress) · feature branch only · not yet wired to inference
+> **Status:** Sprint 4 of 5 (tiered cache data structure complete) · feature branch only · not yet wired to inference
 
 PolarQuant + Lloyd-Max KV cache compression for `llama.cpp`. Achieves higher compression at better quality than current `Q4_0`/`Q5_0`/`Q8_0` modes.
 
@@ -46,9 +46,11 @@ Decompression inverts the pipeline.
 | [`src/llama-kv-turboquant.cpp`](../src/llama-kv-turboquant.cpp) | CPU reference implementation | ✅ Sprint 2 |
 | [`tests/test-tq-kv.cpp`](../tests/test-tq-kv.cpp) | Comprehensive unit tests (16K+ checks + CUDA equivalence) | ✅ Sprint 2/3 |
 | [`src/llama-kv-turboquant-cuda.cu`](../src/llama-kv-turboquant-cuda.cu) | CUDA kernels (Volta sm_70 + Ampere sm_80) | ✅ Sprint 3 |
+| [`src/llama-kv-tiered.{h,cpp}`](../src/llama-kv-tiered.h) | Tiered cache data structure (hot fp16 + cold TQ) | ✅ Sprint 4 |
+| [`tests/test-tq-tiered.cpp`](../tests/test-tq-tiered.cpp) | Tiered cache tests (hot/cold/eviction/stats) | ✅ Sprint 4 |
 | [`.github/workflows/turboquant-kv.yml`](../.github/workflows/turboquant-kv.yml) | CI workflow (CPU build + CUDA build + lint) | ✅ |
-| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types | ⏳ Sprint 4 |
-| `src/llama-kv-cache.cpp` integration | Hot/cold tiering | ⏳ Sprint 4 |
+| `ggml/include/ggml.h` GGML_TYPE_TQ_KV{2,3,4} | New ggml types | ⏳ Sprint 4b |
+| `src/llama-kv-cache.cpp` adapter | Wire tiered_cache into llama_memory_i | ⏳ Sprint 4b |
 | Upstream PR | | ⏳ Sprint 5 |
 
 ## Building and testing
@@ -90,6 +92,45 @@ test_round_trip D=256 bits=3
 
 The CI workflow `.github/workflows/turboquant-kv.yml` runs the same on push/PR.
 
+## Tiered cache (Sprint 4)
+
+[`src/llama-kv-tiered.h`](../src/llama-kv-tiered.h) provides
+`llama_kv_tq::tiered_cache`, a self-contained KV store that mixes a
+small **hot** ring buffer (last `hot_window` tokens, stored fp32 for
+exact reads) with a **cold** TurboQuant-compressed tail. Tokens
+auto-migrate hot→cold when the window fills.
+
+```cpp
+#include "llama-kv-tiered.h"
+
+llama_kv_tq::tiered_cache_config cfg;
+cfg.n_layers   = 32;          // attention layers
+cfg.n_kv_heads = 8;
+cfg.head_dim   = 128;
+cfg.hot_window = 512;         // last 512 tokens stay fp16
+cfg.cold_bits  = llama_kv_tq::BITS_3;
+
+llama_kv_tq::tiered_cache cache(cfg);
+
+// Append a new token's K and V (n_layers*n_kv_heads*head_dim each).
+cache.add_token(k_ptr, v_ptr);
+
+// Read back any previous token (decompresses cold reads on demand).
+cache.get_kv(/*pos=*/0, /*layer=*/4, /*head=*/2, k_out, v_out);
+
+auto s = cache.stats();
+printf("compression: %.2fx (%d hot, %d cold)\n",
+       s.compression_ratio, s.hot_tokens, s.cold_tokens);
+```
+
+This data structure is what Sprint 4b will adapt to `llama_memory_i`
+so the existing prefill/generation graphs route through it
+transparently. Today it is exercised by
+[`tests/test-tq-tiered.cpp`](../tests/test-tq-tiered.cpp): hot-only
+exact equality, post-eviction cosine reconstruction, eviction order,
+memory accounting, multi-layer slot isolation, and a 2,000-token
+stress run with 4 layers × 8 heads.
+
 ## Test coverage
 
 `tests/test-tq-kv.cpp` exercises:
@@ -123,9 +164,20 @@ After CUDA kernels land:
 
 - [x] **Sprint 1** — Foundation (fork, design doc, scaffolding, issues filed)
 - [x] **Sprint 2** — CPU reference + tests + CI
-- [x] **Sprint 3** — CUDA kernels (Volta/Ampere) ← *you are here*
-- [ ] **Sprint 4** — Hot/cold tiering integrated into `llama_kv_cache`
+- [x] **Sprint 3** — CUDA kernels (Volta/Ampere)
+- [x] **Sprint 4** — Tiered cache data structure (hot fp16 + cold TQ) ← *you are here*
+- [ ] **Sprint 4b** — Wire `tiered_cache` into `llama_memory_i` + add `GGML_TYPE_TQ_KV*`
 - [ ] **Sprint 5** — Documentation + benchmarks + upstream PR
+
+### Sprint 4 → 4b scope split
+
+The original plan bundled tiering and the ggml type registration into one
+sprint. In practice these are independent risks: the tiering algorithm
+needs correctness/perf evidence in isolation, while the ggml-side wiring
+(new types, dequantize tables, cuda dispatch, kv-cache adapter,
+prefill/generation graph routing) touches dozens of files across the
+codebase and is best done as its own focused sprint with its own review.
+Sprint 4 ships the proven data structure; Sprint 4b adopts it.
 
 Tracking issue: [ahb-sjsu/turboquant-pro#27](https://github.com/ahb-sjsu/turboquant-pro/issues/27)
 

@@ -200,6 +200,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     add_test(NAME test-tq-kv COMMAND test-tq-kv)
     set_tests_properties(test-tq-kv PROPERTIES LABELS "main")
 
+    # Tiered KV cache (Sprint 4) — hot fp16 + cold TurboQuant.
+    # Pure CPU; reuses llama-kv-turboquant.cpp for compression primitives.
+    add_executable(test-tq-tiered
+        test-tq-tiered.cpp
+        ${PROJECT_SOURCE_DIR}/src/llama-kv-tiered.cpp
+        ${PROJECT_SOURCE_DIR}/src/llama-kv-turboquant.cpp
+    )
+    target_include_directories(test-tq-tiered PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/ggml/include
+    )
+    target_link_libraries(test-tq-tiered PRIVATE ggml)
+    add_test(NAME test-tq-tiered COMMAND test-tq-tiered)
+    set_tests_properties(test-tq-tiered PROPERTIES LABELS "main")
+
     llama_build(test-gbnf-validator.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
