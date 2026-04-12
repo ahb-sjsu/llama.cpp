@@ -132,6 +132,10 @@ llama_kv_cache::llama_kv_cache(
             tq_view_bind_ = (std::atoi(e) != 0);
             if (tq_view_bind_) tq_readthrough_ = true;
         }
+        // Honor explicit READTHROUGH override in the early-env block too.
+        if (const char * e = std::getenv("LLAMA_TQ_READTHROUGH")) {
+            tq_readthrough_ = (std::atoi(e) != 0);
+        }
         // Sprint 4c step 3c-5d: read SHRINK_VIEW early too so
         // view tensor allocation and get_n_kv clamp can both see it.
         if (const char * e = std::getenv("LLAMA_TQ_SHRINK_VIEW")) {
@@ -441,10 +445,6 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_COLD_VALIDATE")) {
             tq_cold_validate_ = (std::atoi(e) != 0);
         }
-        // Sprint 4c step 3c-2b: opt-in write-back readthrough.
-        if (const char * e = std::getenv("LLAMA_TQ_READTHROUGH")) {
-            tq_readthrough_ = (std::atoi(e) != 0);
-        }
         // Sprint 4c step 3c-5a: opt-in view-bind (separate read tensor).
         // Implies readthrough — without it the view tensor stays at the
         // zeros that ggml_backend_buffer_clear initialized it to and
@@ -452,6 +452,15 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_VIEW_BIND")) {
             tq_view_bind_ = (std::atoi(e) != 0);
             if (tq_view_bind_) tq_readthrough_ = true;
+        }
+        // Sprint 4c step 3c-2b: opt-in write-back readthrough. Parse AFTER
+        // view-bind so an explicit LLAMA_TQ_READTHROUGH=0 can override the
+        // view-bind force-enable (useful for isolating whether readthrough
+        // lossy TC substitution is the source of a PPL regression — with
+        // view-bind on and readthrough off, attention reads fp16 straight
+        // from the view at every slot).
+        if (const char * e = std::getenv("LLAMA_TQ_READTHROUGH")) {
+            tq_readthrough_ = (std::atoi(e) != 0);
         }
         // Sprint 4c step 3c-5b: shrink backbone to a small ring. Requires
         // view-bind so attention reads from the view tensor instead of
