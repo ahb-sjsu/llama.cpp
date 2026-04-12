@@ -928,6 +928,151 @@ static void test_push_readback_independent_k_and_v() {
 }
 
 // -------------------------------------------------------------------- //
+// 11. View-validation semantics (Sprint 4c step 3c-2a)                 //
+//                                                                       //
+// The runtime view-validation in llama_kv_cache compares                //
+// materialize_fp16_rows output against the fp16 cache row that was     //
+// just observed. These tests pin the equivalent invariant: that the    //
+// fp16 bytes from materialize agree with the fp16 bytes that came in   //
+// (within fp16 round-trip rounding for hot, compression tolerance for  //
+// cold). When this passes on real model data, the read-side swap in    //
+// step 3c-2b is safe.                                                  //
+// -------------------------------------------------------------------- //
+
+// Helper: convert fp32 to fp16 bytes and back to fp32 to model the
+// rounding the cache row will undergo.
+static void fp32_round_trip_via_fp16(const std::vector<float> & in,
+                                     std::vector<float> & out)
+{
+    const int n = (int) in.size();
+    std::vector<uint16_t> tmp(n);
+    // Use the same fp32->fp16 path the test helper provides for fp16->fp32
+    // by inverting it here. We use a minimal IEEE-half encoder so the test
+    // stays independent of ggml.
+    for (int i = 0; i < n; ++i) {
+        float f = in[i];
+        uint32_t u; std::memcpy(&u, &f, 4);
+        uint32_t s  = (u >> 31) & 0x1;
+        int32_t  e  = (int32_t)((u >> 23) & 0xFF) - 127 + 15;
+        uint32_t m  = u & 0x7FFFFF;
+        uint16_t h;
+        if (e >= 31)      h = (s << 15) | 0x7C00 | (m ? 1 : 0);     // inf/nan
+        else if (e <= 0) {
+            if (e < -10)  h = (s << 15);                             // underflow
+            else {
+                m = (m | 0x800000) >> (1 - e);
+                h = (s << 15) | (m >> 13);
+            }
+        } else            h = (s << 15) | ((uint32_t) e << 10) | (m >> 13);
+        tmp[i] = h;
+    }
+    fp16_row_to_fp32(tmp.data(), n, out);
+}
+
+static void test_materialize_fp16_matches_pushed_fp16_hot() {
+    std::printf("test_materialize_fp16_matches_pushed_fp16_hot\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 32;
+    cfg.hot_window = 8;
+    tiered_cache cache(cfg);
+
+    // Push known data, then materialize the last position. The fp16
+    // bytes from materialize must match the fp32 input round-tripped
+    // through fp16 (i.e. fp16 rounding is the only allowed loss).
+    const int n = cfg.n_kv_heads * cfg.head_dim;
+    std::vector<float> push(n);
+    for (int i = 0; i < n; ++i) push[i] = std::sin((float) i * 0.13f);
+    cache.add_token(push.data(), push.data());
+
+    std::vector<uint16_t> mat;
+    cache.materialize_fp16_rows(cache.n_tokens() - 1, 1,
+                                /*is_v=*/false, mat);
+    CHECK((int) mat.size() == n, "materialize size");
+
+    std::vector<float> mat_f32;
+    fp16_row_to_fp32(mat.data(), n, mat_f32);
+
+    std::vector<float> expected_f32;
+    fp32_round_trip_via_fp16(push, expected_f32);
+
+    float c = cosine_similarity(mat_f32.data(), expected_f32.data(), n);
+    CHECK(c >= 0.9999f, "hot materialize matches fp16(input)");
+
+    // Also for V — should be identical (we pushed same buf for both).
+    cache.materialize_fp16_rows(cache.n_tokens() - 1, 1,
+                                /*is_v=*/true, mat);
+    fp16_row_to_fp32(mat.data(), n, mat_f32);
+    c = cosine_similarity(mat_f32.data(), expected_f32.data(), n);
+    CHECK(c >= 0.9999f, "hot materialize V matches fp16(input)");
+}
+
+static void test_materialize_fp16_matches_pushed_fp16_cold() {
+    std::printf("test_materialize_fp16_matches_pushed_fp16_cold\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 128;
+    cfg.hot_window = 2;
+    cfg.cold_bits  = BITS_3;
+    tiered_cache cache(cfg);
+
+    const int n_tok = 8;
+    std::vector<std::vector<float>> all(n_tok, std::vector<float>(cfg.head_dim));
+    for (int t = 0; t < n_tok; ++t) {
+        for (int i = 0; i < cfg.head_dim; ++i) {
+            all[t][i] = std::cos((t * cfg.head_dim + i) * 0.07f);
+        }
+        cache.add_token(all[t].data(), all[t].data());
+    }
+    CHECK(cache.n_cold_tokens() == 6, "6 cold");
+
+    // Materialize all 6 cold positions and compare to fp16(input)
+    // — for cold, expect compression loss but cosine > 0.93.
+    std::vector<uint16_t> mat;
+    cache.materialize_fp16_rows(0, 6, /*is_v=*/false, mat);
+    CHECK((int) mat.size() == 6 * cfg.head_dim, "size = 6 * head_dim");
+
+    double tot = 0;
+    std::vector<float> mat_f32;
+    std::vector<float> expected_f32;
+    for (int t = 0; t < 6; ++t) {
+        fp16_row_to_fp32(mat.data() + (size_t) t * cfg.head_dim,
+                         cfg.head_dim, mat_f32);
+        fp32_round_trip_via_fp16(all[t], expected_f32);
+        tot += cosine_similarity(
+            mat_f32.data(), expected_f32.data(), cfg.head_dim);
+    }
+    double mean = tot / 6;
+    std::printf("  cold materialize vs fp16(input) cos = %.4f\n", mean);
+    CHECK(mean > 0.93, "cold materialize within 3-bit compression bound");
+}
+
+static void test_materialize_fp16_zero_vector_special_case() {
+    std::printf("test_materialize_fp16_zero_vector_special_case\n");
+    // The runtime cosine code falls back to 1.0 when both vectors are
+    // zero (a "trivial agreement" — comparing nothing against nothing).
+    // This pins that the materialize path actually produces zeros for
+    // a zero input so the runtime fallback applies symmetrically.
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 16;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+
+    std::vector<float> zero(cfg.head_dim, 0.0f);
+    cache.add_token(zero.data(), zero.data());
+
+    std::vector<uint16_t> mat;
+    cache.materialize_fp16_rows(0, 1, false, mat);
+    bool all_zero = true;
+    for (auto x : mat) if (x != 0) { all_zero = false; break; }
+    CHECK(all_zero, "materialize of zero input is all-zero fp16");
+}
+
+// -------------------------------------------------------------------- //
 // Entry point                                                           //
 // -------------------------------------------------------------------- //
 
@@ -954,6 +1099,10 @@ int main() {
     test_push_readback_last_token_hot();
     test_push_readback_last_token_cold_path();
     test_push_readback_independent_k_and_v();
+    // Sprint 4c step 3c-2a: view-validation semantics
+    test_materialize_fp16_matches_pushed_fp16_hot();
+    test_materialize_fp16_matches_pushed_fp16_cold();
+    test_materialize_fp16_zero_vector_special_case();
 
     std::printf("\n=== %d / %d checks passed ===\n",
         n_total - n_failed, n_total);

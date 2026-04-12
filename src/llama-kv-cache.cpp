@@ -363,15 +363,21 @@ llama_kv_cache::llama_kv_cache(
         if (const char * e = std::getenv("LLAMA_TQ_VALIDATE")) {
             tq_validate_ = (std::atoi(e) != 0);
         }
+        // Sprint 4c step 3c-2a: opt-in read-side view validation.
+        if (const char * e = std::getenv("LLAMA_TQ_VIEW_VALIDATE")) {
+            tq_view_validate_ = (std::atoi(e) != 0);
+        }
 
         LLAMA_LOG_INFO(
             "%s: TurboQuant shadow caches allocated (%s/%s): "
-            "%d K layers, %d V layers, hot_window=%d, validate=%d "
-            "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE)\n",
+            "%d K layers, %d V layers, hot_window=%d, validate=%d, "
+            "view_validate=%d "
+            "(env LLAMA_TQ_HOT_WINDOW, LLAMA_TQ_VALIDATE, LLAMA_TQ_VIEW_VALIDATE)\n",
             __func__,
             ggml_type_name(requested_type_k_),
             ggml_type_name(requested_type_v_),
-            n_tq_k, n_tq_v, hot_window, (int) tq_validate_);
+            n_tq_k, n_tq_v, hot_window,
+            (int) tq_validate_, (int) tq_view_validate_);
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -1222,6 +1228,48 @@ void llama_kv_cache::tq_flush_pending_() {
                             if (cos < tq_validate_min_cos_k_) tq_validate_min_cos_k_ = cos;
                         }
                     }
+
+                    // Sprint 4c step 3c-2a: read-side view validation.
+                    // Compare materialize_fp16_rows output (the bytes
+                    // attention WOULD see in step 3c-2b) to the fp16
+                    // cache row we just read (the bytes attention sees
+                    // today). Convert both to fp32 for cosine.
+                    if (tq_view_validate_) {
+                        const int last_pos = tq->n_tokens() - 1;
+                        std::vector<uint16_t> mat_fp16;
+                        tq->materialize_fp16_rows(
+                            last_pos, /*n_positions=*/1, is_v_side, mat_fp16);
+
+                        // mat_fp16 has the same n_elem fp16 values as
+                        // fp16_buf; convert both to fp32 and cosine.
+                        std::vector<float> mat_fp32(n_elem);
+                        std::vector<float> cache_fp32(n_elem);
+                        ggml_fp16_to_fp32_row(
+                            (const ggml_fp16_t *) mat_fp16.data(),
+                            mat_fp32.data(), n_elem);
+                        ggml_fp16_to_fp32_row(
+                            (const ggml_fp16_t *) fp16_buf.data(),
+                            cache_fp32.data(), n_elem);
+
+                        double dot = 0, na = 0, nb = 0;
+                        for (size_t i = 0; i < n_elem; ++i) {
+                            dot += (double) mat_fp32[i] * cache_fp32[i];
+                            na  += (double) mat_fp32[i] * mat_fp32[i];
+                            nb  += (double) cache_fp32[i] * cache_fp32[i];
+                        }
+                        const double denom = std::sqrt(na) * std::sqrt(nb);
+                        const float cos = denom > 1e-12
+                            ? (float) (dot / denom) : 1.0f;  // both zero -> agree
+                        if (is_v_side) {
+                            tq_view_validate_sum_cos_v_ += cos;
+                            tq_view_validate_count_v_++;
+                            if (cos < tq_view_validate_min_cos_v_) tq_view_validate_min_cos_v_ = cos;
+                        } else {
+                            tq_view_validate_sum_cos_k_ += cos;
+                            tq_view_validate_count_k_++;
+                            if (cos < tq_view_validate_min_cos_k_) tq_view_validate_min_cos_k_ = cos;
+                        }
+                    }
                 };
 
                 observe_one(L.k,
@@ -1270,6 +1318,31 @@ void llama_kv_cache::tq_flush_pending_() {
         tq_validate_sum_cos_k_ = 0.0;
         tq_validate_min_cos_k_ = 1.0f;
     }
+    // View validation totals (Sprint 4c step 3c-2a). Same threshold
+    // logic as push/readback validation above.
+    if (tq_view_validate_ && tq_view_validate_count_k_ >= tq_validate_report_every_) {
+        const double mean_k = tq_view_validate_sum_cos_k_ / tq_view_validate_count_k_;
+        LLAMA_LOG_INFO(
+            "%s: TQ view-validate K: mean cos = %.6f, min cos = %.6f over "
+            "%d row comparisons (materialize vs fp16 cache)\n",
+            __func__, mean_k, tq_view_validate_min_cos_k_,
+            tq_view_validate_count_k_);
+        tq_view_validate_count_k_   = 0;
+        tq_view_validate_sum_cos_k_ = 0.0;
+        tq_view_validate_min_cos_k_ = 1.0f;
+    }
+    if (tq_view_validate_ && tq_view_validate_count_v_ >= tq_validate_report_every_) {
+        const double mean_v = tq_view_validate_sum_cos_v_ / tq_view_validate_count_v_;
+        LLAMA_LOG_INFO(
+            "%s: TQ view-validate V: mean cos = %.6f, min cos = %.6f over "
+            "%d row comparisons (materialize vs fp16 cache)\n",
+            __func__, mean_v, tq_view_validate_min_cos_v_,
+            tq_view_validate_count_v_);
+        tq_view_validate_count_v_   = 0;
+        tq_view_validate_sum_cos_v_ = 0.0;
+        tq_view_validate_min_cos_v_ = 1.0f;
+    }
+
     if (tq_validate_ && tq_validate_count_v_ >= tq_validate_report_every_) {
         const double mean_v = tq_validate_sum_cos_v_ / tq_validate_count_v_;
         LLAMA_LOG_INFO(

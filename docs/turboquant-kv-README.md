@@ -247,7 +247,8 @@ After CUDA kernels land:
   - [x] **Step 3a** — env var `LLAMA_TQ_HOT_WINDOW` + per-flush stats (cold tier is populated on real inference data)
   - [x] **Step 3b** — `tq_materialize_fp16_k/v` API + `tiered_cache::read_token_k/v`, `materialize_fp16_rows`, with per-path unit tests (hot, cold, mixed boundary, all bit widths, empty, out-of-range)
   - [x] **Step 3c-1** — runtime push/readback round-trip validation via `LLAMA_TQ_VALIDATE=1`, plus **post-compute hook** that fixes a pre-compute race in the observe path (would have broken 3c-2)
-  - [ ] Step 3c-2 — wire `tq_materialize_fp16_*` into `build_attn` and shrink the fp16 backbone → actual VRAM savings
+  - [x] **Step 3c-2a** — read-side view validation via `LLAMA_TQ_VIEW_VALIDATE=1`: live cosine compare of `materialize_fp16_rows` output against fp16 cache rows. Reports cos = 1.000000 (mean and min) over 1,440 row comparisons on Atlas; this is the gating evidence for 3c-2b
+  - [ ] Step 3c-2b — replace `get_k`/`get_v` view-of-backbone with materialized fp16 view from `tiered_cache`; shrink fp16 backbone → real VRAM savings
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

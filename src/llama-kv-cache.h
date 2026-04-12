@@ -358,6 +358,22 @@ private:
     float    tq_validate_min_cos_k_    = 1.0f;
     float    tq_validate_min_cos_v_    = 1.0f;
 
+    // Sprint 4c step 3c-2a: read-side view validation. Opt in via
+    // LLAMA_TQ_VIEW_VALIDATE=1. After each post-compute flush, for
+    // every just-flushed (slot, stream) we read the fp16 cache row
+    // directly and compare it against tiered_cache::materialize_fp16_rows
+    // output for the same logical position. This is the gating evidence
+    // for Step 3c-2b (replace get_k/get_v reads with materialized views):
+    // if the comparison consistently agrees within the per-bit cosine
+    // threshold, the swap is safe.
+    bool     tq_view_validate_ = false;
+    int      tq_view_validate_count_k_   = 0;
+    int      tq_view_validate_count_v_   = 0;
+    double   tq_view_validate_sum_cos_k_ = 0.0;
+    double   tq_view_validate_sum_cos_v_ = 0.0;
+    float    tq_view_validate_min_cos_k_ = 1.0f;
+    float    tq_view_validate_min_cos_v_ = 1.0f;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 

@@ -61,6 +61,8 @@ RX_TQ_FLUSH   = re.compile(
     r"V=(\d+) \(hot=(\d+) cold=(\d+) ratio=([0-9.]+)x\)")
 RX_VALIDATE   = re.compile(
     r"TQ validate ([KV]):\s*mean cos = ([0-9.]+),\s*min cos = ([0-9.]+)\s*over\s*(\d+)")
+RX_VIEW_VAL   = re.compile(
+    r"TQ view-validate ([KV]):\s*mean cos = ([0-9.]+),\s*min cos = ([0-9.]+)\s*over\s*(\d+)")
 RX_GEN_TOK    = re.compile(r"next token:\s*\d+\s*'([^']*)'")
 
 
@@ -81,6 +83,9 @@ class RunResult:
     tq_validate_mean_cos_k: Optional[float] = None
     tq_validate_min_cos_k:  Optional[float] = None
     tq_validate_n_k:        int = 0
+    tq_view_mean_cos_k:     Optional[float] = None
+    tq_view_min_cos_k:      Optional[float] = None
+    tq_view_n_k:            int = 0
     sampled_tokens: list[str] = field(default_factory=list)
     returncode:    int = 0
     stderr_tail:   str = ""
@@ -115,6 +120,11 @@ def parse_run(output: str, config: str, returncode: int) -> RunResult:
             r.tq_validate_mean_cos_k = float(m.group(2))
             r.tq_validate_min_cos_k  = float(m.group(3))
             r.tq_validate_n_k        = int(m.group(4))
+        m = RX_VIEW_VAL.search(line)
+        if m and m.group(1) == "K":
+            r.tq_view_mean_cos_k = float(m.group(2))
+            r.tq_view_min_cos_k  = float(m.group(3))
+            r.tq_view_n_k        = int(m.group(4))
         m = RX_GEN_TOK.search(line)
         if m: r.sampled_tokens.append(m.group(1))
 
@@ -137,7 +147,8 @@ def run_one(llama_cli: Path,
             threads: int,
             ngl: int,
             timeout_s: int,
-            validate: bool) -> RunResult:
+            validate: bool,
+            view_validate: bool = False) -> RunResult:
     cmd = [
         str(llama_cli),
         "-m", str(model),
@@ -159,6 +170,8 @@ def run_one(llama_cli: Path,
         env["LLAMA_TQ_HOT_WINDOW"] = str(hot_window)
     if validate:
         env["LLAMA_TQ_VALIDATE"] = "1"
+    if view_validate:
+        env["LLAMA_TQ_VIEW_VALIDATE"] = "1"
 
     # llama-cli in this tree has a quirk: after `-n` tokens it emits
     # the perf stats and a short idle-prompt loop that can print for a
@@ -232,20 +245,23 @@ def fmt(x, fmt_="{:.2f}"):
 def print_markdown(results: list[RunResult], baseline: str) -> None:
     bl = next((r for r in results if r.config == baseline), None)
     print(f"\n## TurboQuant KV differential benchmark (baseline = `{baseline}`)\n")
-    print("| Config | Prompt tok/s | Gen tok/s | KV MiB | Δ Gen % | Observed compression | TQ validate cos (K) |")
-    print("|---|---:|---:|---:|---:|---|---|")
+    print("| Config | Prompt tok/s | Gen tok/s | KV MiB | Δ Gen % | Observed compression | Push round-trip cos | View vs fp16 cos |")
+    print("|---|---:|---:|---:|---:|---|---|---|")
     for r in results:
         ratio = "—"
         if r.tq_ratio_last_k is not None:
             ratio = f"K={r.tq_ratio_last_k:.2f}x V={r.tq_ratio_last_v:.2f}x (cold_max={r.tq_cold_max_k})"
         val = "—"
         if r.tq_validate_n_k > 0:
-            val = f"mean {r.tq_validate_mean_cos_k:.6f} / min {r.tq_validate_min_cos_k:.6f} (n={r.tq_validate_n_k})"
+            val = f"{r.tq_validate_mean_cos_k:.6f}/{r.tq_validate_min_cos_k:.6f} (n={r.tq_validate_n_k})"
+        view = "—"
+        if r.tq_view_n_k > 0:
+            view = f"{r.tq_view_mean_cos_k:.6f}/{r.tq_view_min_cos_k:.6f} (n={r.tq_view_n_k})"
         delta = "—"
         if bl and bl.gen_tps and r.gen_tps:
             delta = f"{(r.gen_tps - bl.gen_tps) / bl.gen_tps * 100:+.2f}%"
         print(f"| `{r.config}` | {fmt(r.prompt_tps)} | {fmt(r.gen_tps)} | "
-              f"{fmt(r.kv_mib)} | {delta} | {ratio} | {val} |")
+              f"{fmt(r.kv_mib)} | {delta} | {ratio} | {val} | {view} |")
     print()
 
     # Sampled-token agreement
@@ -296,6 +312,8 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=int, default=90)
     ap.add_argument("--validate",  action="store_true",
                     help="enable LLAMA_TQ_VALIDATE for TQ configs")
+    ap.add_argument("--view-validate", action="store_true",
+                    help="enable LLAMA_TQ_VIEW_VALIDATE for TQ configs")
     ap.add_argument("--max-disagreement-frac", type=float, default=0.1)
     args = ap.parse_args()
 
@@ -311,7 +329,7 @@ def main() -> int:
         print(f"[benchmark] running {cfg}...", file=sys.stderr, flush=True)
         r = run_one(args.llama_cli, args.model, cfg, args.prompt, args.n,
                     args.hot_window, args.threads, args.ngl,
-                    args.timeout_s, args.validate)
+                    args.timeout_s, args.validate, args.view_validate)
         results.append(r)
         if r.returncode != 0:
             print(f"[benchmark] {cfg} FAILED (rc={r.returncode}):", file=sys.stderr)
