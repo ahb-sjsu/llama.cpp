@@ -499,6 +499,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+
+        // Sprint 4c step 3c-3: invalidate TQ slot map for this stream.
+        tq_invalidate_stream_(seq_to_stream[seq_id]);
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -523,6 +526,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+
+            // Sprint 4c step 3c-3: invalidate TQ slot map for this stream.
+            tq_invalidate_stream_(s);
         }
     }
 
@@ -614,6 +620,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
+
+    // Sprint 4c step 3c-3: when sequences live in different streams the
+    // copy moves data into the dst stream's slots — invalidate so a
+    // future readthrough doesn't restore the (now-stale) src data the
+    // dst slots used to hold. Same-stream is metadata-only, no change.
+    if (s0 != s1) {
+        tq_invalidate_stream_(s1);
+    }
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
@@ -636,6 +650,9 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    // Sprint 4c step 3c-3: invalidate TQ slot map (most slots get freed).
+    tq_invalidate_stream_(seq_to_stream[seq_id]);
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -1171,6 +1188,18 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::tq_invalidate_stream_(uint32_t strm) {
+    if (!is_tq()) return;
+    if (strm < tq_slot_to_pos_k_.size()) {
+        std::fill(tq_slot_to_pos_k_[strm].begin(),
+                  tq_slot_to_pos_k_[strm].end(), -1);
+    }
+    if (strm < tq_slot_to_pos_v_.size()) {
+        std::fill(tq_slot_to_pos_v_[strm].begin(),
+                  tq_slot_to_pos_v_[strm].end(), -1);
+    }
+}
+
 void llama_kv_cache::post_compute() {
     // Sprint 4c step 3c-1: the only post-compute work we have today is
     // draining the TQ observation queue. Non-TQ caches skip this.
@@ -1651,9 +1680,19 @@ void llama_kv_cache::tq_flush_pending_() {
                 observe_one(L.k,
                             ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                             k_buf, /*is_v_side=*/false);
-                observe_one(L.v,
-                            ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
-                            v_buf, /*is_v_side=*/true);
+                // Sprint 4c step 3c-3: skip V observe when v_trans=true.
+                // V is stored transposed ([head_dim, kv_size] instead of
+                // [kv_size, head_dim]) so a per-row contiguous read does
+                // NOT capture one token's V values — it captures one
+                // element across many positions. Honest to-not-store
+                // garbage in tq_v_caches than to silently corrupt it.
+                // Use --flash-attn to set v_trans=false and unlock the V
+                // path; the transpose-aware V observe is Sprint 4c-4.
+                if (!v_trans) {
+                    observe_one(L.v,
+                                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                                v_buf, /*is_v_side=*/true);
+                }
             }
         }
     }
@@ -1723,9 +1762,13 @@ void llama_kv_cache::tq_flush_pending_() {
             cold_check_one(layers[ikv].k,
                 ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                 cold_check_k[ikv], /*is_v_side=*/false);
-            cold_check_one(layers[ikv].v,
-                ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
-                cold_check_v[ikv], /*is_v_side=*/true);
+            // Same v_trans skip as above — comparing transposed V with
+            // contiguous-read assumption produces meaningless cosines.
+            if (!v_trans) {
+                cold_check_one(layers[ikv].v,
+                    ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
+                    cold_check_v[ikv], /*is_v_side=*/true);
+            }
         }
     }
 

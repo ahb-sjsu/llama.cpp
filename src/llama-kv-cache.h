@@ -413,6 +413,11 @@ private:
     std::vector<std::vector<int32_t>> tq_slot_to_pos_k_;
     std::vector<std::vector<int32_t>> tq_slot_to_pos_v_;
 
+    // Invalidate the slot map for a single stream. Called from
+    // seq_rm/seq_cp/seq_keep so the writeback doesn't restore data
+    // for slots that have been logically removed.
+    void tq_invalidate_stream_(uint32_t strm);
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 

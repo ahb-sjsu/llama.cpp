@@ -252,7 +252,8 @@ After CUDA kernels land:
   - [x] **Step 3c-2b** — readthrough WORKS via per-stream slot→TC-position mapping. `LLAMA_TQ_READTHROUGH=1` writes K data from `tiered_cache` back into `layers[il].k` after each forward pass, so the next attention step reads through the TQ pipeline. Fixed two bugs along the way: (1) `prepare()`'s tentative `apply_ubatch` was leaking phantom entries into `tq_pending_` (snapshot+truncate fix); (2) slot indices get reused across batches when llama-cli resets the cache, so the original append-order TC-pos→slot-idx mapping was wrong (slot→TC table fix, last-write-wins). End-to-end Atlas results (Qwen2.5-0.5B, K-only readthrough; V skipped pending v_trans handling):
     - hot_window=512 (all-hot, lossless): tq_kv4/3/2 all **0.0% disagreement** vs f16 — exact same generated tokens
     - hot_window=8 (mostly cold, real compression): tq_kv4 0.0%, tq_kv3 66.7%, tq_kv2 87.5%. This is the **real TurboQuant quality curve** on attention output for a 0.5B model
-  - [ ] Step 3c-3 — transpose-aware V observation + V readthrough; shrink fp16 backbone → real VRAM savings; `seq_rm`/`seq_cp`/`seq_add` invalidation of slot map
+  - [x] **Step 3c-3 (partial)** — `seq_rm` / `seq_cp` (different streams) / `seq_keep` invalidate the slot map; `clear` already does. V observation cleanly skipped when `v_trans=true` (no more silently-stored garbage). With `--flash-attn` enabled (which sets `v_trans=false`), V should observe correctly and get readthrough. Backbone shrink + transpose-aware V observation deferred to 3c-4.
+  - [ ] Step 3c-4 — transpose-aware V observation/readthrough (independent of `--flash-attn`); shrink fp16 backbone → real VRAM savings
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split
