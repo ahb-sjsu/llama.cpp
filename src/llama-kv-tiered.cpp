@@ -4,6 +4,10 @@
 
 #include "llama-kv-tiered.h"
 
+#include "ggml.h"
+
+#include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -98,6 +102,108 @@ void tiered_cache::get_kv(int pos, int layer, int head,
     }
     std::copy(tok.k[slot].begin(), tok.k[slot].end(), k_out);
     std::copy(tok.v[slot].begin(), tok.v[slot].end(), v_out);
+}
+
+void tiered_cache::read_token_k(int pos, std::vector<float> & out) const {
+    if (pos < 0 || pos >= n_tokens_) {
+        throw std::out_of_range(
+            "tiered_cache::read_token_k pos=" + std::to_string(pos) +
+            " outside [0, " + std::to_string(n_tokens_) + ")");
+    }
+    const int slots = cfg_.n_layers * cfg_.n_kv_heads;
+    const int D     = cfg_.head_dim;
+    out.assign((size_t) slots * D, 0.0f);
+
+    const int n_cold = static_cast<int>(cold_.size());
+    if (pos < n_cold) {
+        // Cold path.
+        std::vector<float> tmp_v(D);
+        for (int s = 0; s < slots; ++s) {
+            decompress_vector(cold_[pos].k[s], D, cfg_.cold_bits, rot_,
+                              out.data() + (size_t) s * D);
+            (void) tmp_v; // v side intentionally untouched
+        }
+    } else {
+        // Hot path — copy verbatim.
+        const int hot_idx = pos - n_cold;
+        const hot_token & tok = hot_[hot_idx];
+        for (int s = 0; s < slots; ++s) {
+            std::copy(tok.k[s].begin(), tok.k[s].end(),
+                      out.data() + (size_t) s * D);
+        }
+    }
+}
+
+void tiered_cache::read_token_v(int pos, std::vector<float> & out) const {
+    if (pos < 0 || pos >= n_tokens_) {
+        throw std::out_of_range(
+            "tiered_cache::read_token_v pos=" + std::to_string(pos) +
+            " outside [0, " + std::to_string(n_tokens_) + ")");
+    }
+    const int slots = cfg_.n_layers * cfg_.n_kv_heads;
+    const int D     = cfg_.head_dim;
+    out.assign((size_t) slots * D, 0.0f);
+
+    const int n_cold = static_cast<int>(cold_.size());
+    if (pos < n_cold) {
+        for (int s = 0; s < slots; ++s) {
+            decompress_vector(cold_[pos].v[s], D, cfg_.cold_bits, rot_,
+                              out.data() + (size_t) s * D);
+        }
+    } else {
+        const int hot_idx = pos - n_cold;
+        const hot_token & tok = hot_[hot_idx];
+        for (int s = 0; s < slots; ++s) {
+            std::copy(tok.v[s].begin(), tok.v[s].end(),
+                      out.data() + (size_t) s * D);
+        }
+    }
+}
+
+void tiered_cache::materialize_fp16_rows(int start_pos,
+                                         int n_positions,
+                                         bool is_v,
+                                         std::vector<uint16_t> & out) const
+{
+    if (n_positions < 0) {
+        throw std::out_of_range(
+            "tiered_cache::materialize_fp16_rows n_positions=" +
+            std::to_string(n_positions) + " must be >= 0");
+    }
+    if (n_positions == 0) {
+        out.clear();
+        return;
+    }
+    if (start_pos < 0 || start_pos + n_positions > n_tokens_) {
+        throw std::out_of_range(
+            "tiered_cache::materialize_fp16_rows [" +
+            std::to_string(start_pos) + ", " +
+            std::to_string(start_pos + n_positions) +
+            ") outside [0, " + std::to_string(n_tokens_) + ")");
+    }
+
+    const int slots      = cfg_.n_layers * cfg_.n_kv_heads;
+    const int D          = cfg_.head_dim;
+    const size_t row_n   = (size_t) slots * D;
+    const size_t tot_n   = row_n * (size_t) n_positions;
+
+    out.assign(tot_n, 0);
+
+    std::vector<float> row_fp32;
+    row_fp32.reserve(row_n);
+
+    for (int t = 0; t < n_positions; ++t) {
+        const int pos = start_pos + t;
+        if (is_v) {
+            read_token_v(pos, row_fp32);
+        } else {
+            read_token_k(pos, row_fp32);
+        }
+        ggml_fp32_to_fp16_row(
+            row_fp32.data(),
+            reinterpret_cast<ggml_fp16_t *>(out.data() + (size_t) t * row_n),
+            row_n);
+    }
 }
 
 memory_stats tiered_cache::stats() const {

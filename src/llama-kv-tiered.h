@@ -68,6 +68,36 @@ public:
 
     const tiered_cache_config & config() const { return cfg_; }
 
+    // Sprint 4c step 3b: read access for the materialize path.
+    //
+    // Read one token's full K values as fp32, concatenated across all
+    // layers and heads, length = n_layers * n_kv_heads * head_dim.
+    // For hot tokens this is a memcpy; for cold tokens it decompresses.
+    //
+    // `out` is resized to the required length. Throws std::out_of_range
+    // if pos is outside [0, n_tokens()).
+    void read_token_k(int pos, std::vector<float> & out) const;
+
+    // Same for V.
+    void read_token_v(int pos, std::vector<float> & out) const;
+
+    // Bulk materialize: read a contiguous range of positions
+    // [start_pos, start_pos + n_positions) and emit fp16 rows into
+    // `out`, row-major [n_embd_gqa, n_positions] where
+    // n_embd_gqa = n_layers * n_kv_heads * head_dim.
+    //
+    // - is_v=false reads K, is_v=true reads V.
+    // - n_positions == 0 results in an empty output (no throw).
+    // - Throws std::out_of_range if [start_pos, start_pos + n_positions)
+    //   extends beyond n_tokens().
+    //
+    // The output is bit-identical to what ggml_fp32_to_fp16_row would
+    // produce on read_token_k/v output, in the same row order.
+    void materialize_fp16_rows(int start_pos,
+                               int n_positions,
+                               bool is_v,
+                               std::vector<uint16_t> & out) const;
+
 private:
     void evict_oldest_hot_();   // moves hot front into cold tier
     int  slot_index_(int layer, int head) const {

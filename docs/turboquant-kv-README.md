@@ -201,7 +201,8 @@ After CUDA kernels land:
   - [x] **Step 2a** — per-layer `tiered_cache` allocation
   - [x] **Step 2b** — queue + flush observe in `apply_ubatch`/`prepare` (writes now populate tiered_cache)
   - [x] **Step 3a** — env var `LLAMA_TQ_HOT_WINDOW` + per-flush stats (cold tier is populated on real inference data)
-  - [ ] Step 3b — materialize_view + shrink fp16 storage (actual VRAM savings)
+  - [x] **Step 3b** — `tq_materialize_fp16_k/v` API + `tiered_cache::read_token_k/v`, `materialize_fp16_rows`, with per-path unit tests (hot, cold, mixed boundary, all bit widths, empty, out-of-range)
+  - [ ] Step 3c — wire `tq_materialize_fp16_*` into `build_attn` and shrink the fp16 backbone → actual VRAM savings
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

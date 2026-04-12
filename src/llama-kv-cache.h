@@ -172,6 +172,28 @@ public:
             || llama_kv_tq::is_turboquant_kv_type(requested_type_v_);
     }
 
+    // Sprint 4c step 3b: read-side machinery.
+    //
+    // Materialize a contiguous fp16 view of the K (or V) cache for one
+    // layer, covering token positions [start_pos, start_pos + n_positions).
+    // Writes row-major [n_embd_gqa, n_positions] fp16 bytes into `out`.
+    //
+    // - Non-TQ cache or missing tiered_cache for this layer: clears
+    //   `out` and returns (so callers can safely unconditionally invoke).
+    // - Range validation and per-token hot/cold dispatch happens in
+    //   tiered_cache::materialize_fp16_rows.
+    //
+    // NOTE: this function is not yet called by the inference path.
+    // Step 3c wires it into build_attn. Here it is a tested utility.
+    void tq_materialize_fp16_k(int32_t il,
+                               int start_pos,
+                               int n_positions,
+                               std::vector<uint16_t> & out) const;
+    void tq_materialize_fp16_v(int32_t il,
+                               int start_pos,
+                               int n_positions,
+                               std::vector<uint16_t> & out) const;
+
     //
     // graph_build API
     //

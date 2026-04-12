@@ -1108,6 +1108,38 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
+void llama_kv_cache::tq_materialize_fp16_k(int32_t il,
+                                           int start_pos,
+                                           int n_positions,
+                                           std::vector<uint16_t> & out) const
+{
+    out.clear();
+    if (!is_tq()) return;
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return;
+    const int ikv = it->second;
+    if (ikv < 0 || ikv >= (int) tq_k_caches.size()) return;
+    const auto * tq = tq_k_caches[ikv].get();
+    if (!tq) return;
+    tq->materialize_fp16_rows(start_pos, n_positions, /*is_v=*/false, out);
+}
+
+void llama_kv_cache::tq_materialize_fp16_v(int32_t il,
+                                           int start_pos,
+                                           int n_positions,
+                                           std::vector<uint16_t> & out) const
+{
+    out.clear();
+    if (!is_tq()) return;
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return;
+    const int ikv = it->second;
+    if (ikv < 0 || ikv >= (int) tq_v_caches.size()) return;
+    const auto * tq = tq_v_caches[ikv].get();
+    if (!tq) return;
+    tq->materialize_fp16_rows(start_pos, n_positions, /*is_v=*/true, out);
+}
+
 void llama_kv_cache::tq_flush_pending_() {
     if (tq_pending_.empty()) return;
 

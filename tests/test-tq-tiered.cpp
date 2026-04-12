@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -451,6 +452,379 @@ static void test_out_of_range() {
 }
 
 // -------------------------------------------------------------------- //
+// 8. read_token_k / read_token_v correctness (Sprint 4c step 3b)       //
+// -------------------------------------------------------------------- //
+
+static void test_read_token_hot_exact() {
+    std::printf("test_read_token_hot_exact\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 16;
+    cfg.hot_window = 8;
+    cfg.cold_bits  = BITS_3;
+
+    tiered_cache cache(cfg);
+
+    // Push 3 tokens, all stay hot (window=8).
+    std::vector<std::vector<float>> all_k(3), all_v(3);
+    for (int t = 0; t < 3; ++t) {
+        make_token(t, cfg, all_k[t], all_v[t]);
+        cache.add_token(all_k[t].data(), all_v[t].data());
+    }
+
+    std::vector<float> buf;
+    for (int pos = 0; pos < 3; ++pos) {
+        cache.read_token_k(pos, buf);
+        const int n = cfg.n_kv_heads * cfg.head_dim;
+        CHECK((int) buf.size() == n, "read_token_k size");
+        bool ok_k = true;
+        for (int i = 0; i < n; ++i) {
+            if (buf[i] != all_k[pos][i]) { ok_k = false; break; }
+        }
+        CHECK(ok_k, "read_token_k hot is bit-exact");
+
+        cache.read_token_v(pos, buf);
+        bool ok_v = true;
+        for (int i = 0; i < n; ++i) {
+            if (buf[i] != all_v[pos][i]) { ok_v = false; break; }
+        }
+        CHECK(ok_v, "read_token_v hot is bit-exact");
+    }
+}
+
+static void test_read_token_cold_cosine() {
+    std::printf("test_read_token_cold_cosine\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 64;
+    cfg.hot_window = 2;       // force most to evict
+    cfg.cold_bits  = BITS_3;  // ~0.93 cosine target
+
+    tiered_cache cache(cfg);
+
+    const int n_tok = 16;
+    std::vector<std::vector<float>> all_k(n_tok), all_v(n_tok);
+    for (int t = 0; t < n_tok; ++t) {
+        make_token(t, cfg, all_k[t], all_v[t]);
+        cache.add_token(all_k[t].data(), all_v[t].data());
+    }
+
+    CHECK(cache.n_cold_tokens() == n_tok - cfg.hot_window,
+        "expected cold tokens count");
+
+    std::vector<float> buf;
+    double tot_cos_k = 0, tot_cos_v = 0;
+    int n_cold = cache.n_cold_tokens();
+    for (int pos = 0; pos < n_cold; ++pos) {
+        cache.read_token_k(pos, buf);
+        tot_cos_k += cosine_similarity(
+            buf.data(), all_k[pos].data(),
+            cfg.n_kv_heads * cfg.head_dim);
+        cache.read_token_v(pos, buf);
+        tot_cos_v += cosine_similarity(
+            buf.data(), all_v[pos].data(),
+            cfg.n_kv_heads * cfg.head_dim);
+    }
+    double mean_k = tot_cos_k / n_cold;
+    double mean_v = tot_cos_v / n_cold;
+    std::printf("  cold cosine: K=%.4f V=%.4f over %d tokens\n",
+        mean_k, mean_v, n_cold);
+    CHECK(mean_k > 0.93, "read_token_k cold cosine > 0.93 at 3-bit");
+    CHECK(mean_v > 0.93, "read_token_v cold cosine > 0.93 at 3-bit");
+}
+
+static void test_read_token_out_of_range() {
+    std::printf("test_read_token_out_of_range\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 8;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+
+    std::vector<float> k, v;
+    make_token(0, cfg, k, v);
+    cache.add_token(k.data(), v.data());
+
+    std::vector<float> buf;
+    bool threw;
+
+    threw = false;
+    try { cache.read_token_k(-1, buf); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "read_token_k(-1) throws");
+
+    threw = false;
+    try { cache.read_token_k(1, buf); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "read_token_k past end throws");
+
+    threw = false;
+    try { cache.read_token_v(99, buf); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "read_token_v past end throws");
+}
+
+// -------------------------------------------------------------------- //
+// 9. materialize_fp16_rows correctness                                  //
+// -------------------------------------------------------------------- //
+
+// Helper: reverse an fp16 row back to fp32 for comparison.
+static void fp16_row_to_fp32(const uint16_t * src,
+                             int n, std::vector<float> & dst)
+{
+    dst.resize(n);
+    // Minimal fp16 → fp32 reference (ggml_fp16_to_fp32_row is in a
+    // separate TU; we reproduce the IEEE half semantics here to make
+    // the test independent). Bit-layout: 1 sign | 5 exp | 10 mant.
+    for (int i = 0; i < n; ++i) {
+        uint16_t h  = src[i];
+        uint32_t s  = (h >> 15) & 0x1;
+        uint32_t e  = (h >> 10) & 0x1F;
+        uint32_t m  = h & 0x3FF;
+        uint32_t f32;
+        if (e == 0) {
+            if (m == 0) {
+                f32 = s << 31;
+            } else {
+                // subnormal
+                while ((m & 0x400) == 0) { m <<= 1; e -= 1; }
+                e += 1;
+                m &= 0x3FF;
+                f32 = (s << 31) | ((e + 112) << 23) | (m << 13);
+            }
+        } else if (e == 31) {
+            f32 = (s << 31) | 0x7F800000 | (m << 13);
+        } else {
+            f32 = (s << 31) | ((e + 112) << 23) | (m << 13);
+        }
+        float fp32;
+        std::memcpy(&fp32, &f32, 4);
+        dst[i] = fp32;
+    }
+}
+
+static void test_materialize_empty() {
+    std::printf("test_materialize_empty\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 8;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+
+    std::vector<float> k, v;
+    make_token(0, cfg, k, v);
+    cache.add_token(k.data(), v.data());
+
+    std::vector<uint16_t> out;
+    cache.materialize_fp16_rows(0, 0, false, out);
+    CHECK(out.empty(), "n_positions=0 gives empty output for K");
+    cache.materialize_fp16_rows(0, 0, true,  out);
+    CHECK(out.empty(), "n_positions=0 gives empty output for V");
+}
+
+static void test_materialize_negative_n_throws() {
+    std::printf("test_materialize_negative_n_throws\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 8;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+    std::vector<float> k, v;
+    make_token(0, cfg, k, v);
+    cache.add_token(k.data(), v.data());
+
+    std::vector<uint16_t> out;
+    bool threw = false;
+    try { cache.materialize_fp16_rows(0, -1, false, out); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "negative n_positions throws");
+}
+
+static void test_materialize_out_of_range_throws() {
+    std::printf("test_materialize_out_of_range_throws\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 8;
+    cfg.hot_window = 4;
+    tiered_cache cache(cfg);
+    std::vector<float> k, v;
+    for (int t = 0; t < 3; ++t) {
+        make_token(t, cfg, k, v);
+        cache.add_token(k.data(), v.data());
+    }
+
+    std::vector<uint16_t> out;
+    bool threw;
+
+    threw = false;
+    try { cache.materialize_fp16_rows(-1, 2, false, out); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "negative start_pos throws");
+
+    threw = false;
+    try { cache.materialize_fp16_rows(2, 5, false, out); }
+    catch (const std::out_of_range &) { threw = true; }
+    CHECK(threw, "range overrunning n_tokens() throws");
+}
+
+static void test_materialize_all_hot() {
+    std::printf("test_materialize_all_hot\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 8;
+    cfg.hot_window = 8;
+    tiered_cache cache(cfg);
+
+    std::vector<std::vector<float>> all_k(4), all_v(4);
+    for (int t = 0; t < 4; ++t) {
+        make_token(t, cfg, all_k[t], all_v[t]);
+        cache.add_token(all_k[t].data(), all_v[t].data());
+    }
+
+    std::vector<uint16_t> out;
+    cache.materialize_fp16_rows(0, 4, false, out);
+    const int n_row = cfg.n_kv_heads * cfg.head_dim;
+    CHECK((int) out.size() == 4 * n_row, "output row count * width");
+
+    // Convert fp16 back to fp32 and compare — allow tiny rounding since
+    // fp16 has ~3 decimal digits of precision.
+    std::vector<float> recon;
+    for (int t = 0; t < 4; ++t) {
+        fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+        float c = cosine_similarity(recon.data(), all_k[t].data(), n_row);
+        CHECK(c > 0.999f, "hot materialize: cos ≈ 1.0 (fp16 rounding only)");
+    }
+
+    // Same for V
+    cache.materialize_fp16_rows(0, 4, true, out);
+    for (int t = 0; t < 4; ++t) {
+        fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+        float c = cosine_similarity(recon.data(), all_v[t].data(), n_row);
+        CHECK(c > 0.999f, "hot materialize V: cos ≈ 1.0");
+    }
+}
+
+static void test_materialize_all_cold() {
+    std::printf("test_materialize_all_cold\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 2;
+    cfg.head_dim   = 64;
+    cfg.hot_window = 2;
+    cfg.cold_bits  = BITS_3;
+    tiered_cache cache(cfg);
+
+    const int n_tok = 10;
+    std::vector<std::vector<float>> all_k(n_tok), all_v(n_tok);
+    for (int t = 0; t < n_tok; ++t) {
+        make_token(t, cfg, all_k[t], all_v[t]);
+        cache.add_token(all_k[t].data(), all_v[t].data());
+    }
+
+    int n_cold = cache.n_cold_tokens();
+    std::vector<uint16_t> out;
+    cache.materialize_fp16_rows(0, n_cold, false, out);
+
+    const int n_row = cfg.n_kv_heads * cfg.head_dim;
+    std::vector<float> recon;
+    double tot = 0;
+    for (int t = 0; t < n_cold; ++t) {
+        fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+        tot += cosine_similarity(recon.data(), all_k[t].data(), n_row);
+    }
+    double mean = tot / n_cold;
+    std::printf("  all-cold materialize K cosine = %.4f\n", mean);
+    CHECK(mean > 0.93, "all-cold materialize cosine > 0.93 at 3-bit");
+}
+
+static void test_materialize_mixed_boundary() {
+    std::printf("test_materialize_mixed_boundary\n");
+    tiered_cache_config cfg;
+    cfg.n_layers   = 1;
+    cfg.n_kv_heads = 1;
+    cfg.head_dim   = 32;
+    cfg.hot_window = 4;
+    cfg.cold_bits  = BITS_4;   // higher fidelity so cold tail near-exact
+    tiered_cache cache(cfg);
+
+    const int n_tok = 10;  // last 4 hot, first 6 cold
+    std::vector<std::vector<float>> all_k(n_tok), all_v(n_tok);
+    for (int t = 0; t < n_tok; ++t) {
+        make_token(t, cfg, all_k[t], all_v[t]);
+        cache.add_token(all_k[t].data(), all_v[t].data());
+    }
+    CHECK(cache.n_cold_tokens() == 6, "6 cold");
+    CHECK(cache.n_hot_tokens()  == 4, "4 hot");
+
+    // Materialize across boundary: [3, 3 + 5) = positions 3..7 (3 cold, 2 hot)
+    std::vector<uint16_t> out;
+    cache.materialize_fp16_rows(3, 5, false, out);
+
+    const int n_row = cfg.n_kv_heads * cfg.head_dim;
+    std::vector<float> recon;
+
+    // Positions 3, 4, 5 are still cold (cosine > ~0.95 at 4-bit)
+    for (int t = 0; t < 3; ++t) {
+        fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+        float c = cosine_similarity(recon.data(), all_k[3 + t].data(), n_row);
+        CHECK(c > 0.93f, "mixed-range cold slice cosine > 0.93");
+    }
+    // Positions 6, 7 are hot → near-exact
+    for (int t = 3; t < 5; ++t) {
+        fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+        float c = cosine_similarity(recon.data(), all_k[3 + t].data(), n_row);
+        CHECK(c > 0.999f, "mixed-range hot slice cosine ≈ 1.0");
+    }
+}
+
+static void test_materialize_all_bit_widths() {
+    std::printf("test_materialize_all_bit_widths\n");
+    for (llama_kv_tq::bits b : {BITS_2, BITS_3, BITS_4}) {
+        tiered_cache_config cfg;
+        cfg.n_layers   = 1;
+        cfg.n_kv_heads = 1;
+        cfg.head_dim   = 128;
+        cfg.hot_window = 2;
+        cfg.cold_bits  = b;
+        tiered_cache cache(cfg);
+
+        const int n_tok = 12;
+        std::vector<std::vector<float>> all_k(n_tok), all_v(n_tok);
+        for (int t = 0; t < n_tok; ++t) {
+            make_token(t, cfg, all_k[t], all_v[t]);
+            cache.add_token(all_k[t].data(), all_v[t].data());
+        }
+        int n_cold = cache.n_cold_tokens();
+
+        std::vector<uint16_t> out;
+        cache.materialize_fp16_rows(0, n_cold, false, out);
+
+        const int n_row = cfg.head_dim;
+        std::vector<float> recon;
+        double tot = 0;
+        for (int t = 0; t < n_cold; ++t) {
+            fp16_row_to_fp32(out.data() + (size_t) t * n_row, n_row, recon);
+            tot += cosine_similarity(recon.data(), all_k[t].data(), n_row);
+        }
+        double mean = tot / n_cold;
+        // Thresholds mirror the round-trip targets in test-tq-kv.
+        double min_cos = (b == BITS_2) ? 0.82
+                       : (b == BITS_3) ? 0.92
+                       :                 0.97;
+        std::printf("  bits=%d mean cos = %.4f (need > %.2f)\n",
+            (int)b, mean, min_cos);
+        CHECK(mean > min_cos, "materialize cosine meets per-bit target");
+    }
+}
+
+// -------------------------------------------------------------------- //
 // Entry point                                                           //
 // -------------------------------------------------------------------- //
 
@@ -462,6 +836,17 @@ int main() {
     test_slot_isolation();
     test_stress();
     test_out_of_range();
+    // Sprint 4c step 3b: read methods + materialize
+    test_read_token_hot_exact();
+    test_read_token_cold_cosine();
+    test_read_token_out_of_range();
+    test_materialize_empty();
+    test_materialize_negative_n_throws();
+    test_materialize_out_of_range_throws();
+    test_materialize_all_hot();
+    test_materialize_all_cold();
+    test_materialize_mixed_boundary();
+    test_materialize_all_bit_widths();
 
     std::printf("\n=== %d / %d checks passed ===\n",
         n_total - n_failed, n_total);
