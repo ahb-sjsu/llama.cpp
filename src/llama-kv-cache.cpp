@@ -4,6 +4,17 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-turboquant.h"
+
+// Sprint 4c step 1: TQ KV types map to fp16 for the underlying ggml
+// tensor. The tag is still visible to any higher-level code that gates
+// on ggml_is_quantized(), but the bytes on disk/device are fp16 so the
+// existing prefill + attention paths keep working unchanged.
+// Step 2 attaches a tiered_cache per layer and diverts the write/read
+// path through it; step 3 flips on actual compression.
+static ggml_type llama_kv_tq_underlying(ggml_type t) {
+    return llama_kv_tq::is_turboquant_kv_type(t) ? GGML_TYPE_F16 : t;
+}
 
 #include <algorithm>
 #include <cassert>
@@ -94,6 +105,13 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // Sprint 4c step 1: defensive remap in case a TQ tag reaches this
+    // constructor directly (the llama_context boundary already substitutes
+    // for the main inference path). Without this, ggml_new_tensor_3d
+    // would hit blck_size=0 and divide by zero.
+    type_k = llama_kv_tq_underlying(type_k);
+    type_v = llama_kv_tq_underlying(type_v);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 

@@ -2941,24 +2941,30 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    // TurboQuant KV-cache types are tags only at this point — the
-    // storage backend that knows how to allocate, write, and read
-    // them lands in Sprint 4c. Fail clearly here instead of crashing
-    // deep in ggml when blck_size=0.
+    // TurboQuant KV-cache: Sprint 4c step 1 plumbs the types through as
+    // fp16 internally — inference works, but the compression layer
+    // (tiered_cache + cold-tier packing) lands in step 2. Keep the
+    // early visibility here so anyone invoking --cache-type-k tq_kv3
+    // understands the current state; no error until the user actually
+    // expects compression savings.
     auto is_tq_kv = [](enum ggml_type t) {
         return t == GGML_TYPE_TQ_KV2 ||
                t == GGML_TYPE_TQ_KV3 ||
                t == GGML_TYPE_TQ_KV4;
     };
     if (is_tq_kv(params.type_k) || is_tq_kv(params.type_v)) {
-        LLAMA_LOG_ERROR(
-            "%s: cache-type %s/%s is registered but the TurboQuant KV "
-            "storage backend is not yet wired in (Sprint 4c). "
-            "See docs/turboquant-kv-README.md.\n",
+        LLAMA_LOG_WARN(
+            "%s: --cache-type-k/v %s/%s — Sprint 4c step 1 maps these to "
+            "fp16 storage. Inference is correct but no compression "
+            "savings yet. Step 2 attaches the tiered_cache backend.\n",
             __func__,
             ggml_type_name(params.type_k),
             ggml_type_name(params.type_v));
-        return nullptr;
+        // Substitute at the llama_context boundary so downstream
+        // validation (flash-attn blck_size checks, split-mode gates)
+        // sees a concrete packed type instead of blck_size=0.
+        if (is_tq_kv(params.type_k)) params.type_k = GGML_TYPE_F16;
+        if (is_tq_kv(params.type_v)) params.type_v = GGML_TYPE_F16;
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

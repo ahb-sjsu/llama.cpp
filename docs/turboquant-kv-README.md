@@ -169,7 +169,10 @@ After CUDA kernels land:
 - [x] **Sprint 3** — CUDA kernels (Volta/Ampere)
 - [x] **Sprint 4** — Tiered cache data structure (hot fp16 + cold TQ)
 - [x] **Sprint 4b** — `GGML_TYPE_TQ_KV{2,3,4}` registration + CLI parsing
-- [ ] **Sprint 4c** — Wire `tiered_cache` into `llama_kv_cache` ← *you are here* (plan: [`turboquant-kv-sprint4c-plan.md`](turboquant-kv-sprint4c-plan.md))
+- [ ] **Sprint 4c** — Wire `tiered_cache` into `llama_kv_cache` ← *in progress* (plan: [`turboquant-kv-sprint4c-plan.md`](turboquant-kv-sprint4c-plan.md))
+  - [x] **Step 1** — TQ types map to fp16 internally (no crash, no compression yet)
+  - [ ] Step 2 — attach `tiered_cache` per layer + observe writes
+  - [ ] Step 3 — activate eviction + materialize_view + actual compression
 - [ ] **Sprint 5** — Benchmarks + upstream PR
 
 ### Sprint 4 / 4b / 4c scope split

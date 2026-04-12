@@ -112,7 +112,26 @@ fp16 cache.
 
 ## Implementation steps
 
-### Step 1 — `is_tq()` helper + constructor branch
+### Step 1 — Map TQ types → fp16 internally (shipped)
+
+**Status: done.** Sprint 4c step 1 ships the minimum end-to-end change:
+`llama_init_from_model` substitutes `GGML_TYPE_TQ_KV*` with `GGML_TYPE_F16`
+in the `llama_context_params` after warning the user, and the
+`llama_kv_cache` constructor does the same substitution defensively for
+any direct construction path. The rest of the pipeline sees fp16 exactly
+as it always has.
+
+Result: `--cache-type-k tq_kv3` now runs end-to-end without crashing, and
+(by definition — it's literally fp16 internally) produces byte-identical
+generated tokens to `--cache-type-k f16`.
+
+Verified on Atlas (Quadro GV100, Qwen2.5-0.5B): both runs produce
+`"Hello!"` for prompt `"hi"`; `diff` on the generated token region is
+empty (only differences are the loading spinner and timing stats).
+
+No compression yet. That's steps 2 and 3 below.
+
+### Step 1b — `is_tq()` helper + tiered_cache allocation (next)
 
 In `llama-kv-cache.cpp`, add a private `is_tq()` predicate. In
 `llama_kv_cache::llama_kv_cache(...)`:
