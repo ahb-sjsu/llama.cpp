@@ -1185,6 +1185,165 @@ void llama_kv_cache::tq_apply_readthrough_() {
         warned = true;
     }
     GGML_UNUSED(v_trans);
+
+    // Diagnostic mode: LLAMA_TQ_DIAG_WB lets us pin down WHY writeback
+    // breaks. Values:
+    //   1: write zeros to layer 0's K cache, slot 0 only (smallest
+    //      possible perturbation; if this corrupts output, our offset
+    //      math IS correct and the bug is in tensor_set semantics)
+    //   2: read each cache row and write back the SAME bytes (no TC
+    //      involved; if THIS corrupts output, bug is in tensor_set
+    //      itself, not in our materialize/conversion path)
+    static bool diag_init = false;
+    static int  diag_mode = 0;
+    if (!diag_init) {
+        if (const char * e = std::getenv("LLAMA_TQ_DIAG_WB")) {
+            diag_mode = std::atoi(e);
+            if (diag_mode > 0) {
+                LLAMA_LOG_WARN(
+                    "%s: LLAMA_TQ_DIAG_WB=%d (diagnostic mode active)\n",
+                    __func__, diag_mode);
+            }
+        }
+        diag_init = true;
+    }
+
+    if (diag_mode == 1 && !layers.empty() && layers[0].k) {
+        // Write zeros to layer 0 K, slot 0 only.
+        std::vector<uint16_t> zeros(layers[0].k->ne[0], 0);
+        ggml_backend_tensor_set(
+            layers[0].k, zeros.data(), 0,
+            layers[0].k->ne[0] * sizeof(uint16_t));
+    } else if (diag_mode == 2) {
+        // Read-then-write-back the SAME bytes from layer 0 K's
+        // first n_tokens slots.
+        if (!layers.empty() && layers[0].k && !tq_k_caches.empty()
+            && tq_k_caches[0]) {
+            const int n = tq_k_caches[0]->n_tokens();
+            const size_t row_bytes = layers[0].k->nb[1];
+            std::vector<uint16_t> buf(n * layers[0].k->ne[0]);
+            ggml_backend_tensor_get(
+                layers[0].k, buf.data(), 0, (size_t) n * row_bytes);
+            ggml_backend_tensor_set(
+                layers[0].k, buf.data(), 0, (size_t) n * row_bytes);
+        }
+    } else if (diag_mode == 3) {
+        // Read-then-write-back same bytes for ALL layers (K only).
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            auto * cache = layers[ikv].k;
+            if (!cache || ikv >= tq_k_caches.size() || !tq_k_caches[ikv])
+                continue;
+            const int n = tq_k_caches[ikv]->n_tokens();
+            const size_t row_bytes = cache->nb[1];
+            std::vector<uint16_t> buf(n * cache->ne[0]);
+            ggml_backend_tensor_get(
+                cache, buf.data(), 0, (size_t) n * row_bytes);
+            ggml_backend_tensor_set(
+                cache, buf.data(), 0, (size_t) n * row_bytes);
+        }
+    } else if (diag_mode == 5) {
+        // K-only writeback using MATERIALIZE output. Same target as diag 3
+        // but the bytes come from tiered_cache, not from a re-read of the
+        // cache. If diag 3 worked but diag 5 breaks, materialize is
+        // producing different fp16 bytes than what's in the cache (bug
+        // in our fp16 round-trip).
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            auto * cache = layers[ikv].k;
+            if (!cache || ikv >= tq_k_caches.size() || !tq_k_caches[ikv])
+                continue;
+            const int n = tq_k_caches[ikv]->n_tokens();
+            if (n <= 0) continue;
+            std::vector<uint16_t> mat;
+            tq_k_caches[ikv]->materialize_fp16_rows(0, n, false, mat);
+            ggml_backend_tensor_set(
+                cache, mat.data(), 0, mat.size() * sizeof(uint16_t));
+        }
+    } else if (diag_mode == 6) {
+        // Diag 5 minus the conversions: log the byte-diff between
+        // materialize output and the actual cache bytes. If they differ,
+        // we've found the source of corruption.
+        if (!layers.empty() && layers[0].k && !tq_k_caches.empty()
+            && tq_k_caches[0]) {
+            auto * cache = layers[0].k;
+            const int n = tq_k_caches[0]->n_tokens();
+            if (n > 0) {
+                std::vector<uint16_t> mat, cache_buf(n * cache->ne[0]);
+                tq_k_caches[0]->materialize_fp16_rows(0, n, false, mat);
+                ggml_backend_tensor_get(
+                    cache, cache_buf.data(), 0,
+                    (size_t) n * cache->nb[1]);
+                size_t total = std::min(mat.size(), cache_buf.size());
+                size_t diffs = 0;
+                int first_diff = -1;
+                for (size_t i = 0; i < total; ++i) {
+                    if (mat[i] != cache_buf[i]) {
+                        ++diffs;
+                        if (first_diff < 0) first_diff = (int) i;
+                    }
+                }
+                LLAMA_LOG_WARN(
+                    "%s: DIAG 6: layer 0 K -- materialize vs cache: "
+                    "n=%d ne[0]=%d total=%zu diffs=%zu (%.2f%%) first_diff=%d\n",
+                    __func__, n, (int) cache->ne[0], total, diffs,
+                    100.0 * (double) diffs / (double) total, first_diff);
+                // Print first 32 values side-by-side.
+                std::string line = "  cache: ";
+                for (int i = 0; i < 32 && i < (int) total; ++i) {
+                    char buf[16]; std::snprintf(buf, sizeof buf, "%04x ", cache_buf[i]);
+                    line += buf;
+                }
+                LLAMA_LOG_WARN("%s\n", line.c_str());
+                line = "  mat:   ";
+                for (int i = 0; i < 32 && i < (int) total; ++i) {
+                    char buf[16]; std::snprintf(buf, sizeof buf, "%04x ", mat[i]);
+                    line += buf;
+                }
+                LLAMA_LOG_WARN("%s\n", line.c_str());
+                // Find runs of mismatch.
+                int run_start = -1, n_runs = 0;
+                for (size_t i = 0; i < total; ++i) {
+                    bool diff = (mat[i] != cache_buf[i]);
+                    if (diff && run_start < 0) {
+                        run_start = (int) i;
+                    } else if (!diff && run_start >= 0) {
+                        if (n_runs < 4) {
+                            LLAMA_LOG_WARN(
+                                "%s:   diff run [%d..%d) len=%d\n",
+                                __func__, run_start, (int) i,
+                                (int) i - run_start);
+                        }
+                        ++n_runs;
+                        run_start = -1;
+                    }
+                }
+                if (run_start >= 0) {
+                    LLAMA_LOG_WARN(
+                        "%s:   diff run [%d..%d) (final)\n",
+                        __func__, run_start, (int) total);
+                    ++n_runs;
+                }
+                LLAMA_LOG_WARN("%s:   total runs: %d\n", __func__, n_runs);
+            }
+        }
+    } else if (diag_mode == 4) {
+        // Same as diag 3 but ALSO V (will be transposed-wrong, so
+        // expected to break — confirms V transpose bug).
+        for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+            auto round_trip = [](ggml_tensor * cache, int n) {
+                if (!cache || n <= 0) return;
+                const size_t row_bytes = cache->nb[1];
+                std::vector<uint16_t> buf(n * cache->ne[0]);
+                ggml_backend_tensor_get(
+                    cache, buf.data(), 0, (size_t) n * row_bytes);
+                ggml_backend_tensor_set(
+                    cache, buf.data(), 0, (size_t) n * row_bytes);
+            };
+            if (ikv < tq_k_caches.size() && tq_k_caches[ikv])
+                round_trip(layers[ikv].k, tq_k_caches[ikv]->n_tokens());
+            if (ikv < tq_v_caches.size() && tq_v_caches[ikv])
+                round_trip(layers[ikv].v, tq_v_caches[ikv]->n_tokens());
+        }
+    }
 }
 
 void llama_kv_cache::tq_materialize_fp16_k(int32_t il,
