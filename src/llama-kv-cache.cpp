@@ -2535,13 +2535,26 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     // Sprint 4c step 3c-5b: when backbone is shrunk, remap absolute
     // slot indices into the ring via modulo. Per-stream base offset
     // also uses the shrunk size.
-    const uint32_t ring_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
+    //
+    // Pre-Sprint-5 fix: under view-bind, cpy_k's dst is the VIEW
+    // tensor (view_slots wide), not the backbone. Index the VIEW's
+    // slot domain, not the shrunk backbone's. Missing this collapses
+    // every hot write onto slot 0 of the view and destroys inference.
+    uint32_t ring_size;
+    if (tq_view_bind_ && tq_shrink_view_size_ > 0) {
+        ring_size = tq_shrink_view_size_;
+    } else if (tq_shrunk_) {
+        ring_size = tq_shrink_backbone_size_;
+    } else {
+        ring_size = get_size();
+    }
+    const bool do_ring = (tq_view_bind_ && tq_shrink_view_size_ > 0) || tq_shrunk_;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*ring_size;
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             const uint32_t abs_idx = sinfo.idxs[s][i];
-            const uint32_t ring_idx = tq_shrunk_ ? (abs_idx % ring_size) : abs_idx;
+            const uint32_t ring_idx = do_ring ? (abs_idx % ring_size) : abs_idx;
             data[s*sinfo.size() + i] = offs + ring_idx;
         }
     }
@@ -2554,21 +2567,35 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    // Pre-Sprint-5 fix: view-bind makes cpy_v target the view tensor,
+    // so the slot-index domain is view_slots, not the shrunk backbone.
+    uint32_t eff_size;
+    bool do_ring;
+    if (tq_view_bind_ && tq_shrink_view_size_ > 0) {
+        eff_size = tq_shrink_view_size_;
+        do_ring = true;
+    } else if (tq_shrunk_) {
+        eff_size = tq_shrink_backbone_size_;
+        do_ring = true;
+    } else {
+        eff_size = get_size();
+        do_ring = false;
+    }
     if (!v_trans) {
         // Sprint 4c step 3c-5b: same ring-modulo remap as K path.
-        const uint32_t ring_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
+        const uint32_t ring_size = eff_size;
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*ring_size;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 const uint32_t abs_idx = sinfo.idxs[s][i];
-                const uint32_t ring_idx = tq_shrunk_ ? (abs_idx % ring_size) : abs_idx;
+                const uint32_t ring_idx = do_ring ? (abs_idx % ring_size) : abs_idx;
                 data[s*sinfo.size() + i] = offs + ring_idx;
             }
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = tq_shrunk_ ? tq_shrink_backbone_size_ : get_size();
+        const int64_t kv_size = eff_size;
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
@@ -2577,7 +2604,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 const uint32_t abs_idx = sinfo.idxs[s][i];
-                const int64_t ring_idx = tq_shrunk_ ? (abs_idx % kv_size) : abs_idx;
+                const int64_t ring_idx = do_ring ? (abs_idx % kv_size) : abs_idx;
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                     data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + ring_idx;
                 }
