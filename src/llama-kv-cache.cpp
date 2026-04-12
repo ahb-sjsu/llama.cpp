@@ -6,6 +6,8 @@
 #include "llama-context.h"
 #include "llama-kv-turboquant.h"
 
+#include <set>
+
 // Sprint 4c step 1: TQ KV types map to fp16 for the underlying ggml
 // tensor. The tag is still visible to any higher-level code that gates
 // on ggml_is_quantized(), but the bytes on disk/device are fp16 so the
@@ -120,6 +122,18 @@ llama_kv_cache::llama_kv_cache(
     type_k = llama_kv_tq_underlying(type_k);
     type_v = llama_kv_tq_underlying(type_v);
 
+    // Sprint 4c step 3c-5c redo: read env vars BEFORE the layer loop
+    // so the parallel view tensors actually get allocated. (In the
+    // earlier spike these were read after the loop, which silently
+    // made view-bind a no-op — "0% disagreement" was just regular
+    // backbone inference.)
+    if (is_tq()) {
+        if (const char * e = std::getenv("LLAMA_TQ_VIEW_BIND")) {
+            tq_view_bind_ = (std::atoi(e) != 0);
+            if (tq_view_bind_) tq_readthrough_ = true;
+        }
+    }
+
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -134,8 +148,12 @@ llama_kv_cache::llama_kv_cache(
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
+            // Sprint 4c step 3c-5c redo: when view-bind is on, we
+            // allocate K+V plus parallel view_K+view_V per layer, so
+            // the ggml context needs 4x headroom instead of 2x.
+            const size_t per_layer_mul = tq_view_bind_ ? 4u : 2u;
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(per_layer_mul*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -1794,13 +1812,22 @@ void llama_kv_cache::tq_flush_pending_() {
                     }
                 };
 
-                observe_one(L.k,
+                // Sprint 4c step 3c-5c fix: when view-bind is on,
+                // cpy_k writes to the view tensor so observe must
+                // read from it too (the backbone is never written).
+                ggml_tensor * k_obs = L.k;
+                ggml_tensor * v_obs = L.v;
+                if (tq_view_bind_) {
+                    if (ikv < tq_view_k_.size() && tq_view_k_[ikv]) k_obs = tq_view_k_[ikv];
+                    if (ikv < tq_view_v_.size() && tq_view_v_[ikv]) v_obs = tq_view_v_[ikv];
+                }
+                observe_one(k_obs,
                             ikv < tq_k_caches.size() ? tq_k_caches[ikv].get() : nullptr,
                             k_buf, /*is_v_side=*/false);
                 // Sprint 4c step 3c-4: V is now observed correctly even
                 // when v_trans=true (per-element strided read inside
                 // observe_one). Slow but correct.
-                observe_one(L.v,
+                observe_one(v_obs,
                             ikv < tq_v_caches.size() ? tq_v_caches[ikv].get() : nullptr,
                             v_buf, /*is_v_side=*/true);
             }
@@ -2148,6 +2175,20 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
         k = tq_view_k_[ikv];
     }
 
+    // Sprint 4c step 3c-5c redo diagnostic: log once-per-layer which
+    // tensor is being returned. Lets us confirm view-bind redirect is
+    // working (cpy_k trace should show matching pointer).
+    if (getenv("LLAMA_TQ_DIAG_GETK")) {
+        static std::set<int> logged;
+        if (logged.insert(il).second) {
+            LLAMA_LOG_WARN(
+                "%s: il=%d ikv=%d -> tensor=%p name='%s' ne=[%ld,%ld,%ld]\n",
+                __func__, il, ikv, (void*) k,
+                k ? k->name : "(null)",
+                k ? k->ne[0] : 0, k ? k->ne[1] : 0, k ? k->ne[2] : 0);
+        }
+    }
+
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
@@ -2207,6 +2248,28 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     ggml_tensor * k = layers[ikv].k;
 
+    // Sprint 4c step 3c-5c fix: when view-bind is on, cpy_k must
+    // write to the SAME tensor get_k returns. Otherwise the graph
+    // chain write→read is broken (bpftrace confirmed cache_k_l0 vs
+    // tq_view_k_l0 pointer mismatch) and attention reads stale data.
+    if (tq_view_bind_ && ikv < (int) tq_view_k_.size() && tq_view_k_[ikv]) {
+        k = tq_view_k_[ikv];
+    }
+
+    // Sprint 4c step 3c-5c redo diagnostic: once-per-layer log of the
+    // tensor cpy_k is writing to. Compared against the get_k log we
+    // can confirm whether the graph chain write→read is intact.
+    if (getenv("LLAMA_TQ_DIAG_GETK")) {
+        static std::set<int> logged;
+        if (logged.insert(il).second) {
+            LLAMA_LOG_WARN(
+                "%s: il=%d ikv=%d -> tensor=%p name='%s' ne=[%ld,%ld,%ld]\n",
+                __func__, il, ikv, (void*) k,
+                k ? k->name : "(null)",
+                k ? k->ne[0] : 0, k ? k->ne[1] : 0, k ? k->ne[2] : 0);
+        }
+    }
+
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
@@ -2241,6 +2304,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+
+    // Sprint 4c step 3c-5c fix: same redirect as cpy_k.
+    if (tq_view_bind_ && ikv < (int) tq_view_v_.size() && tq_view_v_[ikv]) {
+        v = tq_view_v_[ikv];
+    }
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
