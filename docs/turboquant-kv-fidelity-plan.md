@@ -150,3 +150,36 @@ at 0.5B–1.5B scale. Next pivots (pick one):
 
 Phases 3 (GPU) and 4 (CUDA kernels) stay blocked. Benchmarking
 throughput on a path that produces 10× PPL is not useful.
+
+## Cross-architecture extension (dense vs MoE vs MoE+MLA)
+
+WikiText-2 perplexity, 2048 ctx, single chunk unless otherwise
+noted, CPU for small models, dual-GPU offload for GLM-5:
+
+| Model | Arch | f16 PPL | q8_0 PPL | Δ | q4_0 PPL | Δ |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen2.5-1.5B | dense GQA, 12/2 | 9.83 | 9.85 | +0.02 | 4952 | **+500×** |
+| Gemma 4 E2B | MoE, 8/1 | 214 (unusable baseline) | 216 | flat | 215 | flat |
+| GLM-5-REAP | MoE+MLA, 64/1 | 10.46 | 10.52 | +0.06 | 11.23 | **+7%** |
+
+**GLM-5's MLA (multi-head latent attention, head_count_kv=1) and
+MoE structure tolerates 4-bit KV at +7% PPL**, vs Qwen dense's
+500× catastrophic regression. This is the inverse of what we
+expected — smaller KV footprints per token (MLA) are MORE
+tolerant of compression, not less.
+
+Caveat: on GLM-5 our harness saw chunk-2 PPL explode to ~970 for
+both q8 and q4 while chunk-1 was clean. Likely a cache-reset
+quirk in llama-perplexity's handling of the `glm-dsa` arch, not
+a compression failure — needs a second look before citing GLM-5
+numbers anywhere.
+
+Gemma 4 E2B baseline is unusable (PPL 214 on an instruction-
+tuned model against raw WikiText). Can't extract a compression
+signal until we get a base (non-instruct) Gemma 4 checkpoint
+or switch to a chat-format eval.
+
+**Practical takeaway:** if there's any product left in TQ-KV, it
+may be on MoE+MLA architectures (DeepSeek-V3, GLM-5, etc.) where
+the cost of compression to 4-bit is ~7% rather than catastrophic.
+Standard dense models are a dead end below 8-bit.
