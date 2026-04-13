@@ -183,3 +183,40 @@ or switch to a chat-format eval.
 may be on MoE+MLA architectures (DeepSeek-V3, GLM-5, etc.) where
 the cost of compression to 4-bit is ~7% rather than catastrophic.
 Standard dense models are a dead end below 8-bit.
+
+## TurboQuant-on-GLM-5: negative result
+
+Ran our own `tq_kv3` / `tq_kv4` on the same GLM-5-REAP-50pct
+under view-bind + readthrough:
+
+| Config | PPL chunk-1 | vs f16 |
+|---|---:|---:|
+| f16 | 10.56 | 1.0× |
+| stock q8_0 | 10.52 | ~0% |
+| stock q4_0 | 11.23 | +7% |
+| **tq_kv4 (ours)** | **94.66** | **+797%** |
+| **tq_kv3 (ours)** | **4884** | **+46000×** |
+
+Stock `q4_0` beats our `tq_kv4` by ~100× at the same bit budget
+*on the architecture we thought would be our niche*. Also of note:
+the TQ init log reports `78 K layers, 0 V layers` — GLM-5's MLA
+stores V inside the latent-K path, so our V-side compression
+never activates. K-only compression still destroys quality.
+
+**Final verdict: TurboQuant-KV-for-llama.cpp is not useful.**
+Stock `q8_0` owns the 2× lossless niche; stock `q4_0` owns the
+4× MLA-tolerant niche. Neither is beaten by our current
+implementation. The sub-8-bit regime on dense models isn't
+usable regardless of compression scheme.
+
+If we want to salvage TurboQuant, the promising directions are
+outside llama.cpp:
+
+1. **PyTorch / vLLM KV cache** — there is no stock `q8_0`
+   equivalent there; a well-tuned compression could have a
+   cleaner product story.
+2. **Weight compression for training** — where the paper's
+   theory actually predicts a win.
+3. **Publish the paper and move on** — the fidelity numbers
+   reproduce cleanly; the engineering surface just doesn't have
+   room for another KV compressor on llama.cpp.
